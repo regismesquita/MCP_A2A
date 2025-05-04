@@ -14,6 +14,7 @@ import logging
 import json
 import os
 import sys
+import uuid
 from typing import Dict, List, Optional, Union, Literal, Any
 
 # Set up logging to stderr with more detailed format
@@ -29,7 +30,8 @@ from mcp.server.fastmcp import FastMCP
 
 # A2A imports
 from a2a_min import A2aMinClient
-from a2a_min.base.types import AgentCard, Message, TextPart
+from a2a_min.base.client.card_resolver import A2ACardResolver
+from a2a_min.base.types import AgentCard, Message, TextPart, TaskSendParams
 
 # Create a class to store persistent state
 class ServerState:
@@ -42,34 +44,19 @@ state = ServerState()
 
 
 async def fetch_agent_card(url: str) -> Optional[AgentCard]:
-    """Fetch agent card from an A2A server."""
+    """Fetch agent card from an A2A server using A2ACardResolver."""
     try:
         logger.debug(f"Fetching agent card from {url}")
         
-        # Extract the base URL
-        if url.endswith('/'):
-            base_url = url
-        else:
-            base_url = url + '/'
-        
-        # Directly fetch the agent card from the well-known URL
-        import httpx
-        well_known_url = f"{base_url}.well-known/agent.json"
-        logger.debug(f"Requesting from {well_known_url}")
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(well_known_url)
-            logger.debug(f"Response status: {response.status_code}")
-            if response.status_code == 200:
-                card_data = response.json()
-                logger.debug(f"Received card data: {card_data}")
-                # Convert to AgentCard
-                card = AgentCard(**card_data)
-                return card
-            else:
-                logger.error(f"Failed to fetch agent card: HTTP {response.status_code}")
-                logger.debug(f"Response content: {response.text}")
-                return None
+        # Use the A2ACardResolver from a2a_min to get the agent card
+        card_resolver = A2ACardResolver(url)
+        try:
+            card = card_resolver.get_agent_card()
+            logger.debug(f"Received agent card: {card}")
+            return card
+        except Exception as e:
+            logger.error(f"Failed to fetch agent card: {str(e)}")
+            return None
                 
     except Exception as e:
         logger.exception(f"Error fetching agent card from {url}: {e}")
@@ -173,43 +160,23 @@ async def list_agents() -> Dict[str, Any]:
         logger.debug("list_agents called")
         logger.debug(f"Current registry: {state.registry}")
         
-        # Directly fetch agent cards
-        import httpx
+        # Use the A2ACardResolver to fetch agent cards
         agents = {}
         
         for name, url in state.registry.items():
             try:
                 logger.debug(f"Fetching card for {name} from {url}")
+                card = await fetch_agent_card(url)
                 
-                # Prepare URL
-                if url.endswith('/'):
-                    base_url = url
+                if card:
+                    # Store the card data in a format suitable for JSON response
+                    agents[name] = card.model_dump()
+                    # Update the cache with the fetched card
+                    state.cache[name] = card
                 else:
-                    base_url = url + '/'
-                    
-                well_known_url = f"{base_url}.well-known/agent.json"
-                logger.debug(f"Requesting from {well_known_url}")
-                
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.get(well_known_url)
-                    logger.debug(f"Response status: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        card_data = response.json()
-                        logger.debug(f"Received card data: {card_data}")
-                        agents[name] = card_data
-                    else:
-                        logger.error(f"Failed to fetch agent card for {name}: HTTP {response.status_code}")
+                    logger.error(f"Failed to fetch agent card for {name}")
             except Exception as e:
                 logger.exception(f"Error fetching card for {name}: {e}")
-        
-        # Update the cache with the fetched cards
-        state.cache = {}
-        for name, card_data in agents.items():
-            try:
-                state.cache[name] = AgentCard(**card_data)
-            except Exception as e:
-                logger.exception(f"Error converting card data for {name}: {e}")
         
         logger.info(f"Listing {len(agents)} agents")
         return {
@@ -249,111 +216,88 @@ async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
         logger.debug(f"Using URL: {url}")
         
         try:
-            # Create a client and send message directly via HTTP
-            import httpx
-            import json
-            import uuid
-            
-            # Prepare the URL
-            if url.endswith('/'):
-                base_url = url
-            else:
-                base_url = url + '/'
-                
-            # Prepare the JSON-RPC request
-            request_id = str(uuid.uuid4())
-            json_rpc_request = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tasks/send",
-                "params": {
-                    "id": str(uuid.uuid4()),
-                    "sessionId": str(uuid.uuid4()),
-                    "message": {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                }
-            }
-            
-            logger.debug(f"Sending JSON-RPC request: {json.dumps(json_rpc_request)}")
-            
-            # Send the request
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await client.post(
-                    f"{base_url}",
-                    json=json_rpc_request,
-                    headers={"Content-Type": "application/json"}
-                )
-                
-                logger.debug(f"Response status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    try:
-                        json_response = response.json()
-                        logger.debug(f"Received response: {json.dumps(json_response)}")
-                        
-                        task_data = json_response.get("result", {})
-                        
-                        # Process and return the response
-                        response_data = {
-                            "status": "success",
-                            "task_id": task_data.get("id", "unknown"),
-                            "state": task_data.get("status", {}).get("state", "unknown"),
-                            "artifacts": []
-                        }
-                        
-                        # Extract artifacts
-                        artifacts = task_data.get("artifacts", [])
-                        if artifacts:
-                            logger.debug(f"Received {len(artifacts)} artifacts")
-                            for artifact in artifacts:
-                                artifact_data = {
-                                    "name": artifact.get("name", ""),
-                                    "content": []
-                                }
-                                
-                                for part in artifact.get("parts", []):
-                                    part_type = part.get("type")
-                                    if part_type == "text":
-                                        artifact_data["content"].append({
-                                            "type": "text", 
-                                            "text": part.get("text", "")
-                                        })
-                                    elif part_type == "file":
-                                        file_data = part.get("file", {})
-                                        artifact_data["content"].append({
-                                            "type": "file", 
-                                            "name": file_data.get("name", ""),
-                                            "mime_type": file_data.get("mimeType", "")
-                                        })
-                                    elif part_type == "data":
-                                        artifact_data["content"].append({
-                                            "type": "data", 
-                                            "data": part.get("data", {})
-                                        })
-                                
-                                response_data["artifacts"].append(artifact_data)
-                        
-                        logger.info(f"Successfully called agent {agent_name}")
-                        return response_data
-                    except json.JSONDecodeError as e:
-                        logger.exception(f"Error decoding JSON response: {e}")
-                        return {
-                            "status": "error",
-                            "message": f"Error decoding response: {str(e)}"
-                        }
+            # Get or create agent card if needed
+            if agent_name not in state.cache:
+                logger.debug(f"Agent card not in cache, fetching for {agent_name}")
+                card = await fetch_agent_card(url)
+                if card:
+                    state.cache[agent_name] = card
                 else:
-                    logger.error(f"Error response: HTTP {response.status_code}")
+                    logger.error(f"Failed to fetch agent card for {agent_name}")
                     return {
                         "status": "error",
-                        "message": f"HTTP error {response.status_code}: {response.text}"
+                        "message": f"Failed to fetch agent card for {agent_name}"
                     }
+            
+            # Create a client using A2aMinClient
+            try:
+                # Connect to the A2A server
+                logger.debug(f"Connecting to A2A server at {url}")
+                client = A2aMinClient.connect(url)
+                
+                # Prepare message and send
+                logger.debug(f"Sending message to agent {agent_name}: {prompt[:50]}...")
+                task_id = str(uuid.uuid4())
+                session_id = str(uuid.uuid4())
+                
+                # Send the message and get response
+                task = await client.send_message(
+                    message=prompt,
+                    task_id=task_id,
+                    session_id=session_id
+                )
+                
+                # Process and return the response
+                logger.debug(f"Received task response: {task}")
+                
+                response_data = {
+                    "status": "success",
+                    "task_id": task.id,
+                    "state": task.status.state if hasattr(task, 'status') else "unknown",
+                    "artifacts": []
+                }
+                
+                # Extract artifacts
+                artifacts = task.artifacts if hasattr(task, 'artifacts') else []
+                if artifacts:
+                    logger.debug(f"Received {len(artifacts)} artifacts")
+                    for artifact in artifacts:
+                        artifact_data = {
+                            "name": artifact.name,
+                            "content": []
+                        }
+                        
+                        for part in artifact.parts:
+                            part_type = part.type
+                            if part_type == "text":
+                                artifact_data["content"].append({
+                                    "type": "text", 
+                                    "text": part.text
+                                })
+                            elif part_type == "file":
+                                file_data = part.file
+                                artifact_data["content"].append({
+                                    "type": "file", 
+                                    "name": file_data.name,
+                                    "mime_type": file_data.mimeType
+                                })
+                            elif part_type == "data":
+                                artifact_data["content"].append({
+                                    "type": "data", 
+                                    "data": part.data
+                                })
+                        
+                        response_data["artifacts"].append(artifact_data)
+                
+                logger.info(f"Successfully called agent {agent_name}")
+                return response_data
+                
+            except Exception as e:
+                logger.exception(f"Error using A2aMinClient: {e}")
+                return {
+                    "status": "error",
+                    "message": f"Error calling agent with A2aMinClient: {str(e)}"
+                }
         
         except Exception as e:
             logger.exception(f"Error calling agent {agent_name}: {e}")
