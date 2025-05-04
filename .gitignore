@@ -1,0 +1,5 @@
+**/.claude/settings.local.json
+*.md
+*.mdc
+!/agents/README.md
+!/README.md 
