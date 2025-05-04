@@ -206,15 +206,55 @@ async def main():
     else:
         input_text = "Hello, please process this text and show me the agent chain in action!"
     
-    # Call Agent 1 (which will forward to Agent 2)
+    print("\n=== Direct Agent Connection (Legacy Mode) ===")
+    print("Note: With the new pipeline orchestration, direct connections between agents are no longer needed.")
+    print("Instead, use the MCP server's pipeline tools to define and execute agent workflows.\n")
+    
+    # Call Agent 1 directly (no longer forwards to Agent 2)
     result = await call_agent_1_with_sse(input_text)
     
-    # If Agent 1 completed successfully, monitor Agent 2
-    if result and result.get("status", {}).get("state") == "completed":
-        # Get task ID for Agent 2 (appended with _agent2)
-        task_id = result.get("id", "")
-        if task_id:
-            await monitor_agent_2(f"{task_id}_agent2")
+    # Show pipeline example
+    print("\n=== Pipeline Orchestration Example ===")
+    print("To use the pipeline orchestration, connect to the MCP server and use these MCP tools:\n")
+    print("1. Define a pipeline:")
+    print("""   {
+     "name": "Process and Finalize",
+     "description": "Two-step pipeline with processor and finalizer agents",
+     "version": "1.0.0",
+     "nodes": [
+       {
+         "id": "process",
+         "agent_name": "processor"
+       },
+       {
+         "id": "finalize",
+         "agent_name": "finalizer",
+         "inputs": {
+           "processed_data": {
+             "source_node": "process",
+             "source_artifact": "processed_data"
+           }
+         }
+       }
+     ],
+     "final_outputs": ["finalize"]
+   }""")
+    
+    print("\n2. Save this as a template:")
+    print("   save_pipeline_template(template_id='process_and_finalize', pipeline_definition=...)")
+    
+    print("\n3. Execute the pipeline:")
+    print("   execute_pipeline_from_template(template_id='process_and_finalize', input_text='Your text here')")
+    
+    print("\n4. Get pipeline status:")
+    print("   get_pipeline_status(pipeline_id='...')")
+    
+    print("\n5. Send input if required:")
+    print("   send_pipeline_input(pipeline_id='...', node_id='process', input_text='Additional info')")
+    
+    print("\n6. Monitor or cancel the pipeline:")
+    print("   list_pipelines()")
+    print("   cancel_pipeline(pipeline_id='...')")
 
 if __name__ == "__main__":
     asyncio.run(main())

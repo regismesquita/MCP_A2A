@@ -185,15 +185,23 @@ class ServerState:
         self.execution_logs = {}  # request_id -> execution log
         self.last_update_time = {}  # request_id -> timestamp
         
+        # Add pipeline storage
+        self.pipeline_templates = {}  # template_id -> pipeline definition
+        self.pipelines = {}  # pipeline_id -> pipeline state
+        
         # Create a throttler for updates with 1-second interval, batch size of 5
         self.update_throttler = UpdateThrottler[Dict[str, Any]](
             min_interval=1.0,
             batch_size=5,
             max_queue_size=100
         )
+        
+        # Create pipeline execution engine (initialized later to avoid circular imports)
+        self.pipeline_engine = None
     
     def track_request(self, request_id: str, agent_name: str, task_id: str, 
-                     session_id: str) -> None:
+                     session_id: str, pipeline_id: Optional[str] = None,
+                     node_id: Optional[str] = None) -> None:
         """
         Add a new request to active_requests.
         
@@ -202,6 +210,8 @@ class ServerState:
             agent_name: The name of the agent being called
             task_id: The A2A task ID
             session_id: The A2A session ID
+            pipeline_id: Optional pipeline ID if part of a pipeline
+            node_id: Optional node ID if part of a pipeline
         """
         self.active_requests[request_id] = {
             "agent_name": agent_name,
@@ -212,7 +222,10 @@ class ServerState:
             "progress": 0.0,
             "chain_position": {"current": 1, "total": 1},
             "last_message": "Request submitted",
-            "updates": []
+            "updates": [],
+            "pipeline_id": pipeline_id,
+            "node_id": node_id,
+            "artifacts": []
         }
         self.last_update_time[request_id] = time.time()
         self.execution_logs[request_id] = []
@@ -394,6 +407,211 @@ class ServerState:
             List of log entries
         """
         return self.execution_logs.get(request_id, [])
+        
+    async def call_agent_for_pipeline(self, agent_name: str, prompt: str, pipeline_id: str, 
+                                     node_id: str, request_id: str, task_id: str, 
+                                     session_id: str, ctx) -> Dict[str, Any]:
+        """
+        Call an agent as part of a pipeline.
+        
+        Args:
+            agent_name: Name of the agent to call
+            prompt: Prompt to send to the agent
+            pipeline_id: The pipeline ID
+            node_id: The node ID within the pipeline
+            request_id: The request ID
+            task_id: The A2A task ID
+            session_id: The A2A session ID
+            ctx: The context for progress reporting
+            
+        Returns:
+            Dict with status information
+        """
+        try:
+            logger.debug(f"call_agent_for_pipeline called with agent_name={agent_name}, prompt={prompt[:50]}...")
+            logger.debug(f"Current registry: {self.registry}")
+            
+            # Verify the agent exists
+            if agent_name not in self.registry:
+                error_msg = f"Agent '{agent_name}' not found in registry"
+                logger.warning(error_msg)
+                await ctx.error(error_msg)
+                return {"status": "error", "message": error_msg}
+            
+            # Get the URL for the agent
+            url = self.registry[agent_name]
+            logger.debug(f"Using URL: {url}")
+            
+            try:
+                # Prepare the URL
+                if url.endswith('/'):
+                    base_url = url
+                else:
+                    base_url = url + '/'
+                
+                # Track request with pipeline info
+                self.track_request(
+                    request_id=request_id,
+                    agent_name=agent_name,
+                    task_id=task_id,
+                    session_id=session_id,
+                    pipeline_id=pipeline_id,
+                    node_id=node_id
+                )
+                
+                # Update initial status with context
+                await self.update_request_status(
+                    request_id=request_id,
+                    status="submitted",
+                    message=f"Sending prompt to {agent_name}",
+                    ctx=ctx
+                )
+                
+                # Prepare the JSON-RPC request using tasks/sendSubscribe for streaming updates
+                json_rpc_request = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tasks/sendSubscribe",
+                    "params": {
+                        "id": task_id,
+                        "sessionId": session_id,
+                        "message": {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "type": "text",
+                                    "text": prompt
+                                }
+                            ]
+                        }
+                    }
+                }
+                
+                logger.debug(f"Sending JSON-RPC request: {json.dumps(json_rpc_request)}")
+                
+                # Update status to working
+                await self.update_request_status(
+                    request_id=request_id,
+                    status="working",
+                    message=f"Connected to {agent_name}, waiting for response...",
+                    ctx=ctx
+                )
+                
+                # Send the request and process streaming responses
+                import httpx
+                
+                try:
+                    async with httpx.AsyncClient(timeout=600.0) as client:
+                        async with client.stream(
+                            "POST",
+                            base_url,
+                            json=json_rpc_request,
+                            headers={"Content-Type": "application/json"},
+                            timeout=600.0  # 10 minutes timeout
+                        ) as response:
+                            logger.debug(f"Streaming response started with status code: {response.status_code}")
+                            
+                            if response.status_code != 200:
+                                error_text = await response.text()
+                                logger.error(f"Error response: HTTP {response.status_code}: {error_text}")
+                                
+                                await self.update_request_status(
+                                    request_id=request_id,
+                                    status="failed",
+                                    message=f"HTTP error {response.status_code}: {error_text[:100]}...",
+                                    ctx=ctx
+                                )
+                                
+                                return {
+                                    "status": "error",
+                                    "message": f"Error from agent: HTTP {response.status_code}",
+                                    "request_id": request_id
+                                }
+                            
+                            # Process the streaming response
+                            buffer = ""
+                            async for chunk in response.aiter_text():
+                                buffer += chunk
+                                
+                                # Try to extract complete JSON objects from the buffer
+                                while "\n" in buffer:
+                                    line, buffer = buffer.split("\n", 1)
+                                    if not line.strip():
+                                        continue
+                                    
+                                    try:
+                                        update = json.loads(line)
+                                        await process_agent_update(request_id, agent_name, update, ctx)
+                                        
+                                        # Extract and store artifacts if present
+                                        if "result" in update and "artifacts" in update["result"]:
+                                            self.active_requests[request_id]["artifacts"] = update["result"]["artifacts"]
+                                    except json.JSONDecodeError as e:
+                                        logger.warning(f"Error decoding JSON from chunk: {line[:100]}... - {e}")
+                            
+                            # Process any remaining data in the buffer
+                            if buffer.strip():
+                                try:
+                                    update = json.loads(buffer)
+                                    await process_agent_update(request_id, agent_name, update, ctx)
+                                    
+                                    # Extract and store artifacts if present
+                                    if "result" in update and "artifacts" in update["result"]:
+                                        self.active_requests[request_id]["artifacts"] = update["result"]["artifacts"]
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"Error decoding JSON from final chunk: {buffer[:100]}... - {e}")
+                            
+                            # Mark as completed if we haven't already
+                            request_info = self.get_request_info(request_id)
+                            if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
+                                await self.update_request_status(
+                                    request_id=request_id,
+                                    status="completed",
+                                    progress=1.0,
+                                    message=f"Completed response from {agent_name}",
+                                    ctx=ctx
+                                )
+                    
+                    # Extract artifacts from the completed request
+                    request_info = self.get_request_info(request_id)
+                    artifacts = request_info.get("artifacts", []) if request_info else []
+                    
+                    # Return the final status
+                    return {
+                        "status": "success",
+                        "message": "Task completed",
+                        "request_id": request_id,
+                        "artifacts": artifacts
+                    }
+                    
+                except Exception as e:
+                    logger.exception(f"Error processing streaming response for {request_id}: {e}")
+                    
+                    # Update status to failed
+                    await self.update_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        message=f"Error: {str(e)}",
+                        ctx=ctx
+                    )
+                    
+                    return {
+                        "status": "error",
+                        "message": f"Error processing response: {str(e)}",
+                        "request_id": request_id
+                    }
+                
+            except Exception as e:
+                logger.exception(f"Error calling agent {agent_name}: {e}")
+                await ctx.error(f"Error calling agent: {str(e)}")
+                return {
+                    "status": "error",
+                    "message": f"Error calling agent: {str(e)}"
+                }
+        except Exception as e:
+            logger.exception(f"Error in call_agent_for_pipeline: {str(e)}")
+            await ctx.error(f"Error: {str(e)}")
+            return {"status": "error", "message": f"Error: {str(e)}"}
     
     def export_execution_log(self, request_id: str, 
                             format_type: Literal["text", "json"] = "text") -> str:
@@ -513,6 +731,96 @@ mcp = FastMCP(
 )
 
 # Register tools
+@mcp.tool()
+async def execute_pipeline(pipeline_definition: Dict[str, Any], input_text: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Execute a pipeline from a JSON definition.
+    
+    Args:
+        pipeline_definition: The pipeline definition in JSON format
+        input_text: The input text to the pipeline
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with pipeline execution information
+    """
+    try:
+        logger.debug(f"execute_pipeline called with definition {json.dumps(pipeline_definition)[:200]}...")
+        
+        await ctx.report_progress(current=0.1, total=1.0, message="Validating pipeline definition")
+        
+        # Import the required classes
+        from a2a_mcp_server.pipeline import PipelineDefinition
+        
+        try:
+            # Validate the pipeline definition
+            pipeline_def = PipelineDefinition(pipeline_definition)
+            logger.info(f"Validated pipeline: {pipeline_def}")
+        except (jsonschema.exceptions.ValidationError, ValueError) as e:
+            error_msg = f"Invalid pipeline definition: {str(e)}"
+            logger.error(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        await ctx.report_progress(current=0.2, total=1.0, message=f"Starting pipeline execution: {pipeline_def.definition['name']}")
+        
+        # Execute the pipeline
+        pipeline_id = await state.pipeline_engine.execute_pipeline(pipeline_def, input_text, ctx)
+        
+        logger.info(f"Started pipeline execution: {pipeline_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Pipeline {pipeline_def.definition['name']} started",
+            "pipeline_id": pipeline_id
+        }
+    except Exception as e:
+        logger.exception(f"Error in execute_pipeline: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def get_pipeline_status(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Get the status of a pipeline execution.
+    
+    Args:
+        pipeline_id: The ID of the pipeline execution
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with pipeline status information
+    """
+    try:
+        logger.debug(f"get_pipeline_status called for pipeline_id={pipeline_id}")
+        
+        await ctx.report_progress(current=0.5, total=1.0, message=f"Retrieving status for pipeline {pipeline_id}")
+        
+        # Check if the pipeline exists
+        if pipeline_id not in state.pipelines:
+            error_msg = f"Pipeline {pipeline_id} not found"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Get the pipeline state
+        pipeline_state = state.pipelines[pipeline_id]
+        
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Retrieved status for pipeline {pipeline_id}")
+        
+        # Convert to a dictionary for the response
+        pipeline_info = pipeline_state.to_dict()
+        
+        return {
+            "status": "success",
+            "message": f"Pipeline status retrieved",
+            "pipeline": pipeline_info
+        }
+    except Exception as e:
+        logger.exception(f"Error in get_pipeline_status: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
 @mcp.tool()
 async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: Optional[str] = None, ctx: Context) -> Dict[str, Any]:
     """
@@ -1302,6 +1610,469 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
 
 # Define tool for listing active requests
 @mcp.tool()
+async def save_pipeline_template(template_id: str, pipeline_definition: Dict[str, Any], 
+                                ctx: Context) -> Dict[str, Any]:
+    """
+    Save a pipeline definition as a template for reuse.
+    
+    Args:
+        template_id: Unique identifier for the template
+        pipeline_definition: The pipeline definition in JSON format
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with template information
+    """
+    try:
+        logger.debug(f"save_pipeline_template called with template_id={template_id}")
+        
+        await ctx.report_progress(current=0.1, total=1.0, message="Validating pipeline definition")
+        
+        # Import the required classes
+        from a2a_mcp_server.pipeline import PipelineDefinition
+        
+        try:
+            # Validate the pipeline definition
+            pipeline_def = PipelineDefinition(pipeline_definition)
+            logger.info(f"Validated pipeline template: {pipeline_def}")
+        except (jsonschema.exceptions.ValidationError, ValueError) as e:
+            error_msg = f"Invalid pipeline definition: {str(e)}"
+            logger.error(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        await ctx.report_progress(current=0.5, total=1.0, message=f"Saving pipeline template: {template_id}")
+        
+        # Save the template
+        state.pipeline_templates[template_id] = pipeline_definition
+        
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Pipeline template saved: {template_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Pipeline template saved: {template_id}",
+            "template_id": template_id
+        }
+    except Exception as e:
+        logger.exception(f"Error in save_pipeline_template: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def list_pipeline_templates(ctx: Context) -> Dict[str, Any]:
+    """
+    List all available pipeline templates.
+    
+    Args:
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with template information
+    """
+    try:
+        logger.debug("list_pipeline_templates called")
+        
+        await ctx.report_progress(current=0.5, total=1.0, message="Retrieving pipeline templates")
+        
+        # Get template information
+        templates = {}
+        for template_id, definition in state.pipeline_templates.items():
+            templates[template_id] = {
+                "name": definition.get("name", "Unnamed Pipeline"),
+                "description": definition.get("description", ""),
+                "node_count": len(definition.get("nodes", [])),
+                "version": definition.get("version", "1.0.0")
+            }
+        
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Found {len(templates)} pipeline templates")
+        
+        return {
+            "status": "success",
+            "message": f"Found {len(templates)} pipeline templates",
+            "templates": templates
+        }
+    except Exception as e:
+        logger.exception(f"Error in list_pipeline_templates: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def execute_pipeline_from_template(template_id: str, input_text: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Execute a pipeline from a saved template.
+    
+    Args:
+        template_id: The ID of the template to execute
+        input_text: The input text to the pipeline
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with pipeline execution information
+    """
+    try:
+        logger.debug(f"execute_pipeline_from_template called with template_id={template_id}")
+        
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Looking for template: {template_id}")
+        
+        # Check if the template exists
+        if template_id not in state.pipeline_templates:
+            error_msg = f"Pipeline template {template_id} not found"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Get the template definition
+        pipeline_definition = state.pipeline_templates[template_id]
+        
+        await ctx.report_progress(current=0.3, total=1.0, message=f"Executing pipeline from template: {template_id}")
+        
+        # Execute the pipeline using the existing tool
+        result = await execute_pipeline(pipeline_definition, input_text, ctx)
+        
+        return result
+    except Exception as e:
+        logger.exception(f"Error in execute_pipeline_from_template: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def cancel_pipeline(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Cancel an in-progress pipeline execution.
+    
+    Args:
+        pipeline_id: The ID of the pipeline execution to cancel
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with status information
+    """
+    try:
+        logger.debug(f"cancel_pipeline called for pipeline_id={pipeline_id}")
+        
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Verifying pipeline: {pipeline_id}")
+        
+        # Check if the pipeline exists
+        if pipeline_id not in state.pipelines:
+            error_msg = f"Pipeline {pipeline_id} not found"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Get the pipeline state
+        pipeline_state = state.pipelines[pipeline_id]
+        
+        await ctx.report_progress(current=0.3, total=1.0, message=f"Canceling pipeline: {pipeline_id}")
+        
+        # Update pipeline status to canceled
+        from a2a_mcp_server.pipeline import PipelineStatus, NodeStatus
+        
+        pipeline_state.status = PipelineStatus.CANCELED
+        pipeline_state.message = "Pipeline canceled by user"
+        pipeline_state.end_time = time.time()
+        
+        # Cancel the current node if it's still in progress
+        current_node = pipeline_state.get_current_node()
+        if current_node and current_node.status in [NodeStatus.SUBMITTED, NodeStatus.WORKING, NodeStatus.INPUT_REQUIRED]:
+            current_node.status = NodeStatus.CANCELED
+            current_node.message = "Node canceled by user"
+            current_node.end_time = time.time()
+            
+            # If we have a task_id and session_id, try to cancel the agent task
+            if current_node.task_id and current_node.session_id:
+                # Try to cancel the agent task
+                agent_name = current_node.agent_name
+                if agent_name in state.registry:
+                    url = state.registry[agent_name]
+                    
+                    try:
+                        # Prepare the URL
+                        if url.endswith('/'):
+                            base_url = url
+                        else:
+                            base_url = url + '/'
+                        
+                        # Prepare the JSON-RPC cancel request
+                        json_rpc_request = {
+                            "jsonrpc": "2.0",
+                            "id": str(uuid.uuid4()),
+                            "method": "tasks/cancel",
+                            "params": {
+                                "id": current_node.task_id,
+                                "sessionId": current_node.session_id
+                            }
+                        }
+                        
+                        # Send the cancel request
+                        await ctx.report_progress(current=0.5, total=1.0, message=f"Canceling agent task for {agent_name}")
+                        
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            response = await client.post(
+                                f"{base_url}",
+                                json=json_rpc_request,
+                                headers={"Content-Type": "application/json"}
+                            )
+                            
+                            logger.debug(f"Cancel response status: {response.status_code}")
+                    except Exception as e:
+                        logger.exception(f"Error canceling agent task: {e}")
+        
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Pipeline canceled: {pipeline_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Pipeline canceled: {pipeline_id}",
+            "pipeline_id": pipeline_id
+        }
+    except Exception as e:
+        logger.exception(f"Error in cancel_pipeline: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def send_pipeline_input(pipeline_id: str, node_id: str, input_text: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Send input to a pipeline node that is in the input-required state.
+    
+    Args:
+        pipeline_id: The ID of the pipeline execution
+        node_id: The ID of the node requiring input
+        input_text: The input text to send
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with status information
+    """
+    try:
+        logger.debug(f"send_pipeline_input called for pipeline_id={pipeline_id}, node_id={node_id}")
+        
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Verifying pipeline: {pipeline_id}")
+        
+        # Check if the pipeline exists
+        if pipeline_id not in state.pipelines:
+            error_msg = f"Pipeline {pipeline_id} not found"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Get the pipeline state
+        pipeline_state = state.pipelines[pipeline_id]
+        
+        # Check if the node exists
+        if node_id not in pipeline_state.nodes:
+            error_msg = f"Node {node_id} not found in pipeline {pipeline_id}"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Get the node state
+        from a2a_mcp_server.pipeline import NodeStatus
+        
+        node_state = pipeline_state.nodes[node_id]
+        
+        # Check if the node is in the input-required state
+        if node_state.status != NodeStatus.INPUT_REQUIRED:
+            error_msg = f"Node {node_id} is not waiting for input (status: {node_state.status})"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Check if we have the task_id and session_id
+        if not node_state.task_id or not node_state.session_id:
+            error_msg = f"Node {node_id} does not have task_id or session_id"
+            logger.error(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        # Send input to the agent
+        agent_name = node_state.agent_name
+        if agent_name not in state.registry:
+            error_msg = f"Agent {agent_name} not found in registry"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        url = state.registry[agent_name]
+        
+        await ctx.report_progress(current=0.3, total=1.0, message=f"Sending input to {agent_name} for node {node_id}")
+        
+        try:
+            # Prepare the URL
+            if url.endswith('/'):
+                base_url = url
+            else:
+                base_url = url + '/'
+            
+            # Prepare the JSON-RPC request
+            request_id = str(uuid.uuid4())
+            json_rpc_request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tasks/sendInput",
+                "params": {
+                    "id": node_state.task_id,
+                    "sessionId": node_state.session_id,
+                    "message": {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "type": "text",
+                                "text": input_text
+                            }
+                        ]
+                    }
+                }
+            }
+            
+            # Update node status to working
+            node_state.status = NodeStatus.WORKING
+            node_state.message = f"Processing input: {input_text[:50]}..."
+            
+            # Update pipeline status
+            pipeline_state.update_status()
+            pipeline_state.update_progress()
+            
+            await ctx.report_progress(
+                current=pipeline_state.progress,
+                total=1.0,
+                message=pipeline_state.message
+            )
+            
+            # Send the request
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{base_url}",
+                    json=json_rpc_request,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                logger.debug(f"Input response status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    try:
+                        json_response = response.json()
+                        logger.debug(f"Received input response: {json.dumps(json_response)}")
+                        
+                        # Update the node status based on the response
+                        task_data = json_response.get("result", {})
+                        status_data = task_data.get("status", {})
+                        task_state = status_data.get("state", "working")
+                        
+                        # Update node status
+                        node_state.message = status_data.get("message", f"Processing input: {input_text[:50]}...")
+                        
+                        # Update pipeline status
+                        pipeline_state.update_status()
+                        pipeline_state.update_progress()
+                        
+                        await ctx.report_progress(
+                            current=pipeline_state.progress,
+                            total=1.0,
+                            message=pipeline_state.message
+                        )
+                        
+                        return {
+                            "status": "success",
+                            "message": f"Input sent to node {node_id} in pipeline {pipeline_id}",
+                            "node_status": task_state
+                        }
+                    except Exception as e:
+                        error_msg = f"Error processing response: {str(e)}"
+                        logger.exception(error_msg)
+                        await ctx.error(error_msg)
+                        return {"status": "error", "message": error_msg}
+                else:
+                    error_text = await response.text()
+                    error_msg = f"Error sending input: HTTP {response.status_code}: {error_text}"
+                    logger.error(error_msg)
+                    
+                    # Revert node status to input-required
+                    node_state.status = NodeStatus.INPUT_REQUIRED
+                    node_state.message = f"Error sending input: HTTP {response.status_code}"
+                    
+                    # Update pipeline status
+                    pipeline_state.update_status()
+                    pipeline_state.update_progress()
+                    
+                    await ctx.report_progress(
+                        current=pipeline_state.progress,
+                        total=1.0,
+                        message=pipeline_state.message
+                    )
+                    
+                    await ctx.error(error_msg)
+                    return {"status": "error", "message": error_msg}
+        except Exception as e:
+            error_msg = f"Error sending input to node {node_id}: {str(e)}"
+            logger.exception(error_msg)
+            
+            # Revert node status to input-required
+            node_state.status = NodeStatus.INPUT_REQUIRED
+            node_state.message = f"Error sending input: {str(e)}"
+            
+            # Update pipeline status
+            pipeline_state.update_status()
+            pipeline_state.update_progress()
+            
+            await ctx.report_progress(
+                current=pipeline_state.progress,
+                total=1.0,
+                message=pipeline_state.message
+            )
+            
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+    except Exception as e:
+        logger.exception(f"Error in send_pipeline_input: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
+async def list_pipelines(ctx: Context) -> Dict[str, Any]:
+    """
+    List all active and completed pipelines.
+    
+    Args:
+        ctx: The FastMCP context for progress reporting
+        
+    Returns:
+        Dict with pipeline information
+    """
+    try:
+        logger.debug("list_pipelines called")
+        
+        await ctx.report_progress(current=0.5, total=1.0, message="Retrieving pipelines")
+        
+        # Get pipeline information
+        pipeline_info = {}
+        for pipeline_id, pipeline_state in state.pipelines.items():
+            pipeline_info[pipeline_id] = {
+                "name": pipeline_state.definition.definition.get("name", "Unnamed Pipeline"),
+                "status": pipeline_state.status.value if hasattr(pipeline_state.status, "value") else pipeline_state.status,
+                "progress": pipeline_state.progress,
+                "start_time": pipeline_state.start_time,
+                "end_time": pipeline_state.end_time,
+                "message": pipeline_state.message,
+                "node_count": len(pipeline_state.nodes),
+                "completed_nodes": sum(1 for node in pipeline_state.nodes.values() 
+                                     if node.status == "completed" or getattr(node.status, "value", "") == "completed")
+            }
+        
+        count_message = f"Found {len(pipeline_info)} pipelines"
+        await ctx.report_progress(current=1.0, total=1.0, message=count_message)
+        
+        return {
+            "status": "success",
+            "message": count_message,
+            "pipeline_count": len(pipeline_info),
+            "pipelines": pipeline_info
+        }
+    except Exception as e:
+        logger.exception(f"Error in list_pipelines: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+@mcp.tool()
 async def list_requests(ctx: Context) -> Dict[str, Any]:
     """
     List all active requests.
@@ -1350,6 +2121,9 @@ async def list_requests(ctx: Context) -> Dict[str, Any]:
 
 def main():
     """Run the MCP server."""
+    # Import the pipeline module and initialize the pipeline engine
+    from a2a_mcp_server.pipeline import PipelineExecutionEngine
+    state.pipeline_engine = PipelineExecutionEngine(state)
     return mcp
 
 

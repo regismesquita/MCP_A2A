@@ -147,8 +147,10 @@ The server can orchestrate interactions between multiple agents in a chain while
 - **Agent Discovery**: List available agents with their capabilities
 - **Progress Visibility**: Real-time status updates during agent execution
 - **Multi-Agent Chains**: View progress across agent chains with position information
+- **Pipeline Orchestration**: Define and execute complex multi-agent workflows using JSON
 - **User Interaction**: Support for input requests and task cancellation
 - **Execution Logging**: Save and export detailed logs of agent executions
+- **Reusable Templates**: Save pipeline definitions as templates for easy reuse
 
 ## Technical Architecture
 
@@ -163,16 +165,23 @@ The server can orchestrate interactions between multiple agents in a chain while
 │  │    - active_requests                │  │  ● JSON-RPC for A2A         ││
 │  │    - execution_logs                 │  │    protocol communication   ││
 │  │    - update_throttler               │  │  ● Throttling mechanism     ││
+│  │    - pipelines                      │  │                             ││
+│  │    - pipeline_templates             │  │                             ││
 │  │                                     │  │                             ││
 │  └─────────────────────────────────────┘  └─────────────────────────────┘│
 │                                                                          │
 │  ┌─ MCP Tools ──────────────────────────────────────────────────────────┐│
 │  │                                                                      ││
-│  │  1. a2a_server_registry    4. cancel_request                         ││
-│  │  2. list_agents            5. send_input                             ││
-│  │  3. call_agent             6. export_logs                            ││
-│  │                            7. list_requests                          ││
-│  │                                                                      ││
+│  │  Agent Management:                     Pipeline Management:          ││
+│  │  1. a2a_server_registry                8. execute_pipeline           ││
+│  │  2. list_agents                        9. get_pipeline_status        ││
+│  │  3. call_agent                         10. cancel_pipeline           ││
+│  │  4. cancel_request                     11. send_pipeline_input       ││
+│  │  5. send_input                         12. save_pipeline_template    ││
+│  │  6. export_logs                        13. list_pipeline_templates   ││
+│  │  7. list_requests                      14. execute_pipeline_from_    ││
+│  │                                            template                  ││
+│  │                                        15. list_pipelines            ││
 │  └──────────────────────────────────────────────────────────────────────┘│
 │                                                                          │
 │  ┌─ Performance ────────────────────────┐  ┌─ Error Handling ───────────┐│
@@ -185,12 +194,25 @@ The server can orchestrate interactions between multiple agents in a chain while
 │  │                                      │  │                            ││
 │  └──────────────────────────────────────┘  └────────────────────────────┘│
 │                                                                          │
+│  ┌─ Pipeline Orchestration ───────────────────────────────────────────┐  │
+│  │                                                                     │  │
+│  │  ● JSON-based declarative pipeline definitions                      │  │
+│  │  ● Dependency-aware node execution                                  │  │
+│  │  ● Input/output mapping between agents                              │  │
+│  │  ● Configurable error policies                                      │  │
+│  │  ● Real-time progress tracking at node and pipeline levels          │  │
+│  │  ● Reusable pipeline templates                                      │  │
+│  │                                                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Tools
 
-The server provides several MCP tools:
+The server provides multiple MCP tools for agent and pipeline management:
+
+### Agent Management Tools
 
 1. **a2a_server_registry** - Register or remove A2A servers
    ```json
@@ -242,10 +264,96 @@ The server provides several MCP tools:
    {}
    ```
 
+### Pipeline Management Tools
+
+8. **execute_pipeline** - Execute a pipeline from a JSON definition
+   ```json
+   {
+     "pipeline_definition": {
+       "name": "Text Processing Pipeline",
+       "nodes": [
+         {
+           "id": "process",
+           "agent_name": "processor"
+         },
+         {
+           "id": "finalize",
+           "agent_name": "finalizer",
+           "inputs": {
+             "processed_data": {
+               "source_node": "process",
+               "source_artifact": "processed_data"
+             }
+           }
+         }
+       ],
+       "final_outputs": ["finalize"]
+     },
+     "input_text": "Process this text through the pipeline"
+   }
+   ```
+
+9. **get_pipeline_status** - Get status info for a running pipeline
+   ```json
+   {
+     "pipeline_id": "pipeline-uuid-here"
+   }
+   ```
+
+10. **cancel_pipeline** - Cancel an in-progress pipeline
+    ```json
+    {
+      "pipeline_id": "pipeline-uuid-here"
+    }
+    ```
+
+11. **send_pipeline_input** - Send input to a node in a pipeline
+    ```json
+    {
+      "pipeline_id": "pipeline-uuid-here",
+      "node_id": "process",
+      "input_text": "Additional input for the node"
+    }
+    ```
+
+12. **save_pipeline_template** - Save a pipeline definition as a reusable template
+    ```json
+    {
+      "template_id": "my-pipeline-template",
+      "pipeline_definition": {
+        "name": "My Reusable Pipeline",
+        "nodes": [
+          /* ... node definitions ... */
+        ],
+        "final_outputs": ["output-node-id"]
+      }
+    }
+    ```
+
+13. **list_pipeline_templates** - List all saved pipeline templates
+    ```json
+    {}
+    ```
+
+14. **execute_pipeline_from_template** - Execute a pipeline from a saved template
+    ```json
+    {
+      "template_id": "my-pipeline-template",
+      "input_text": "Process this text through the template pipeline"
+    }
+    ```
+
+15. **list_pipelines** - List all active and completed pipelines
+    ```json
+    {}
+    ```
+
 ## Workflow
 
+### Single Agent Workflow
+
 ```ascii
-┌─ Typical User Workflow ───────────────────────────────────────────────────┐
+┌─ Single Agent Workflow ───────────────────────────────────────────────────┐
 │                                                                           │
 │ ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────────────┐│
 │ │ 1. Registration │  │ 2. Discovery    │  │ 3. Agent Execution           ││
@@ -266,11 +374,38 @@ The server provides several MCP tools:
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Pipeline Orchestration Workflow
+
+```ascii
+┌─ Pipeline Orchestration Workflow ─────────────────────────────────────────┐
+│                                                                           │
+│ ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────────────┐│
+│ │ 1. Registration │  │ 2. Pipeline     │  │ 3. Pipeline Execution        ││
+│ │                 │  │    Definition   │  │                              ││
+│ │ Register A2A    │  │                 │  │ Execute pipeline with        ││
+│ │ servers with    │  │ Define pipeline │  │ initial input                ││
+│ │ a2a_server_     │  │ with nodes and  │  │ Monitor real-time progress   ││
+│ │ registry        │  │ dependencies    │  │ Respond to input requests    ││
+│ │                 │  │                 │  │ Cancel pipeline if needed    ││
+│ └─────────────────┘  └─────────────────┘  └──────────────────────────────┘│
+│                                                                           │
+│ ┌─────────────────┐  ┌─────────────────────────────────────────────────┐  │
+│ │ 4. Templates    │  │ 5. Post-Execution                               │  │
+│ │                 │  │                                                 │  │
+│ │ Save pipeline   │  │ Export execution logs for review                │  │
+│ │ as template     │  │ List active/completed pipelines                 │  │
+│ │ Execute from    │  │ Use final outputs for subsequent processing     │  │
+│ │ template        │  │                                                 │  │
+│ └─────────────────┘  └─────────────────────────────────────────────────┘  │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Demo Agents
 
-The repository includes two demo A2A agents in the `agents` directory to showcase the progress visibility features:
+The repository includes two demo A2A agents in the `agents` directory to showcase the progress visibility and pipeline orchestration features:
 
-- **Agent 1 (Processor)**: First agent in the chain - processes input and forwards to Agent 2
+- **Agent 1 (Processor)**: First agent in the chain - processes input with progress updates
 - **Agent 2 (Finalizer)**: Second agent - finalizes processing of intermediate results
 
 These agents demonstrate:
@@ -278,7 +413,11 @@ These agents demonstrate:
 - Agent chain position information
 - Input requests
 - Task cancellation
-- Passing data between agents
+- Artifact production for pipeline orchestration
+
+These agents can be used in two ways:
+1. Direct invocation via the `call_agent` tool
+2. As nodes in a pipeline via the pipeline orchestration tools
 
 See the [agents/README.md](agents/README.md) file for setup and testing instructions.
 

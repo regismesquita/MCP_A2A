@@ -125,7 +125,7 @@ async def process_data(task_id: str, text: str) -> None:
         tasks[task_id]["artifacts"] = [{
             "name": "processed_data",
             "parts": [{"type": "text", "text": processed_text}],
-            "metadata": {"chain_position": "1/2"}
+            "metadata": {"chain_position": {"current": 1, "total": 2}}
         }]
         
         # Update status to completed
@@ -135,63 +135,8 @@ async def process_data(task_id: str, text: str) -> None:
             "progress": 1.0
         }
         
-        # Forward to Agent 2 if not in standalone mode
-        forward_to_agent2 = os.environ.get("AGENT1_STANDALONE", "false").lower() != "true"
-        if forward_to_agent2:
-            try:
-                await forward_to_agent_2(task_id, processed_text)
-            except Exception as e:
-                logger.exception(f"Error forwarding to Agent 2: {e}")
-                tasks[task_id]["status"] = {
-                    "state": TaskState.FAILED,
-                    "message": f"Failed to forward to Agent 2: {str(e)}",
-                    "progress": 1.0
-                }
-
-async def forward_to_agent_2(task_id: str, processed_text: str) -> None:
-    """
-    Forward processed results to Agent 2.
-    """
-    logger.info(f"Forwarding processed data to Agent 2 for task {task_id}")
-    
-    # Agent 2 URL (configurable)
-    agent2_url = os.environ.get("AGENT2_URL", "http://localhost:8002")
-    
-    # Prepare JSON-RPC request
-    request_data = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "tasks/send",
-        "params": {
-            "id": f"{task_id}_agent2",
-            "sessionId": tasks[task_id]["sessionId"],
-            "message": {
-                "role": "user",
-                "parts": [
-                    {
-                        "type": "text",
-                        "text": processed_text
-                    }
-                ]
-            }
-        }
-    }
-    
-    # Send request to Agent 2
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            agent2_url,
-            json=request_data,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        # Log response
-        logger.debug(f"Agent 2 response status: {response.status_code}")
-        if response.status_code == 200:
-            logger.info("Successfully forwarded to Agent 2")
-        else:
-            logger.error(f"Error forwarding to Agent 2: {response.text}")
-            raise Exception(f"Agent 2 returned status {response.status_code}")
+        # Note: Agent forwarding is now handled by the pipeline orchestration in the MCP server
+        # instead of being hardcoded in the agent
 
 # A2A Protocol Endpoints
 
