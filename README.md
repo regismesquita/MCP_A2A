@@ -1,8 +1,16 @@
 # A2A MCP Server
 
-A Model Context Protocol (MCP) server that provides Claude Desktop access to A2A protocol agents with real-time progress visibility.
+A Model Context Protocol (MCP) server that provides Claude Desktop and other MCP clients access to A2A protocol agents with real-time progress visibility.
 > Developer friendly more than production ready, you can hack it to adapt to your needs and expand on whatever you need.
 > But probably not the best idea to deploy into prod as-is.
+
+## Transport Modes
+
+The server supports two transport modes:
+- **STDIO**: For use with Claude Desktop and other MCP clients that use STDIO transport
+- **HTTP**: For use with HTTP-based MCP clients
+
+You can specify the transport mode using the `--transport` command-line argument or the `MCP_TRANSPORT` environment variable.
 
 ## Architecture Overview
 
@@ -11,19 +19,21 @@ This project creates a bridge between Claude Desktop and agents implementing the
 ```ascii
 ┌───────────────────┐      ┌────────────────────────┐      ┌────────────────────┐
 │                   │      │                        │      │                    │
-│  Claude Desktop   │◄────►│  A2A MCP Server Bridge │◄────►│  A2A Protocol      │
-│  (MCP Client)     │      │  (This Project)        │      │  Agents            │
-│                   │      │                        │      │                    │
+│  MCP Client       │◄────►│  A2A MCP Server Bridge │◄────►│  A2A Protocol      │
+│  (Claude Desktop  │      │  (This Project)        │      │  Agents            │
+│   or other)       │      │                        │      │                    │
 └───────────────────┘      └────────────────────────┘      └────────────────────┘
-                             ▲
-                             │ Streaming progress updates 
-                             ▼
-                           ┌────────────────────────┐
-                           │                        │
-                           │  Agent Registry        │
-                           │  (In-memory state)     │
-                           │                        │
-                           └────────────────────────┘
+       ▲                     ▲     │
+       │                     │     │ 
+       │                     │     │ FastMCP 2.0 Context
+       │                     │     │ (Progress Updates)
+       │ STDIO or HTTP       │     ▼
+       │ Transport           │  ┌────────────────────────┐
+       │                     │  │                        │
+       └─────────────────────┘  │  Agent Registry        │
+                                │  (In-memory state)     │
+                                │                        │
+                                └────────────────────────┘
 ```
 
 ## Real-Time Progress Visibility
@@ -33,17 +43,25 @@ Unlike simpler implementations, this server provides streaming progress updates 
 ```ascii
 ┌─ Progress Streaming Implementation ───────────────────────────────────────┐
 │                                                                           │
-│  Claude   ◄───┐                                                           │
-│  Desktop      │                                                           │
-│               │ SSE/                                                      │
-│               │ Streaming HTTP                                            │
+│  MCP      ◄───┐                                                           │
+│  Client        │                                                           │
+│               │ STDIO or                                                  │
+│               │ HTTP Transport                                            │
 │  A2A MCP      │                                                           │
 │  Server  ─────┘                  ┌──────────────────┐                     │
-│    │                             │ UpdateThrottler  │                     │
-│    │                             │ - Rate limiting  │                     │
-│    ▼                             │ - Batching       │                     │
-│  Agent  ───────────────────────► │ - Prioritization │                     │
-│                                  └──────────────────┘                     │
+│    │                             │ UpdateThrottler  │ ◄────┐              │
+│    │                             │ - Rate limiting  │      │              │
+│    ▼                             │ - Batching       │      │              │
+│  Agent  ───────────────────────► │ - Prioritization │      │              │
+│                                  └──────────────────┘      │              │
+│                                          │                 │              │
+│                                          ▼                 │              │
+│                            ┌─────────────────────────┐     │              │
+│                            │ FastMCP 2.0 Context     │     │              │
+│                            │ - report_progress()     │─────┘              │
+│                            │ - complete()            │                    │
+│                            │ - error()               │                    │
+│                            └─────────────────────────┘                    │
 │                                          │                                │
 │                                          ▼                                │
 │                                  ┌──────────────────┐                     │
@@ -139,11 +157,12 @@ The server can orchestrate interactions between multiple agents in a chain while
 │                                                                          │
 │  ┌─ Core Components ───────────────────┐  ┌─ Communication ─────────────┐│
 │  │                                     │  │                             ││
-│  │  ● ServerState                      │  │  ● JSON-RPC over HTTP       ││
-│  │    - registry (name → url)          │  │  ● SSE for real-time        ││
-│  │    - cache (name → AgentCard)       │  │    streaming                ││
-│  │    - active_requests                │  │  ● Connection upgrades      ││
-│  │    - execution_logs                 │  │  ● Throttling mechanism     ││
+│  │  ● ServerState                      │  │  ● FastMCP 2.0 Context      ││
+│  │    - registry (name → url)          │  │    for progress reporting   ││
+│  │    - cache (name → AgentCard)       │  │  ● STDIO and HTTP transports││
+│  │    - active_requests                │  │  ● JSON-RPC for A2A         ││
+│  │    - execution_logs                 │  │    protocol communication   ││
+│  │    - update_throttler               │  │  ● Throttling mechanism     ││
 │  │                                     │  │                             ││
 │  └─────────────────────────────────────┘  └─────────────────────────────┘│
 │                                                                          │
@@ -158,10 +177,11 @@ The server can orchestrate interactions between multiple agents in a chain while
 │                                                                          │
 │  ┌─ Performance ────────────────────────┐  ┌─ Error Handling ───────────┐│
 │  │                                      │  │                            ││
-│  │  ● Update throttling                 │  │  ● Graceful degradation    ││
-│  │  ● Batch processing                  │  │  ● Detailed logging        ││
-│  │  ● Connection timeouts               │  │  ● Error state tracking    ││
-│  │  ● Heartbeat mechanism               │  │  ● Client notifications    ││
+│  │  ● Update throttling                 │  │  ● Context-based error     ││
+│  │  ● Batch processing                  │  │    handling                ││
+│  │  ● Rate limiting                     │  │  ● Detailed logging        ││
+│  │  ● Progress prioritization           │  │  ● Error state tracking    ││
+│  │  ● Similar update merging            │  │  ● Client notifications    ││
 │  │                                      │  │                            ││
 │  └──────────────────────────────────────┘  └────────────────────────────┘│
 │                                                                          │
@@ -305,11 +325,12 @@ See the [agents/README.md](agents/README.md) file for setup and testing instruct
 
 ## Technical Implementation
 
-- Uses Streamable HTTP transport with SSE endpoints for real-time updates
-- Supports bi-directional communication with automatic connection upgrades
-- Implements throttling mechanism to prevent overwhelming the client
+- Uses FastMCP 2.0 with Context-based progress reporting
+- Supports both STDIO and HTTP transports for flexibility
+- Implements sophisticated throttling mechanism to prevent overwhelming clients
 - Tracks task states through the A2A protocol lifecycle
 - Provides detailed execution logging and export capabilities
+- Uses modern async/await patterns throughout the codebase
 
 ## Local Testing
 
@@ -317,4 +338,4 @@ This server has been tested locally with both the included demo agents and exter
 
 ## Purpose
 
-This bridge allows Claude Desktop to interact with any A2A-compatible agent with real-time progress visibility, extending Claude's capabilities through the MCP tools interface.
+This bridge allows Claude Desktop and other MCP clients to interact with any A2A-compatible agent with real-time progress visibility, extending their capabilities through the MCP tools interface. The server can be used with both STDIO and HTTP transports, making it compatible with a wide range of MCP clients.

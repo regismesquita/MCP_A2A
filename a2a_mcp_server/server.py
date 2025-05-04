@@ -170,7 +170,7 @@ class UpdateThrottler(Generic[T]):
             queue.clear()
 
 # MCP imports
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 
 # A2A imports
 from a2a_min import A2aMinClient
@@ -218,10 +218,11 @@ class ServerState:
         self.execution_logs[request_id] = []
         logger.debug(f"Tracking new request: {request_id}")
     
-    def update_request_status(self, request_id: str, status: str, 
-                             progress: Optional[float] = None, 
-                             message: Optional[str] = None,
-                             chain_position: Optional[Dict[str, int]] = None) -> bool:
+    async def update_request_status(self, request_id: str, status: str, 
+                              progress: Optional[float] = None, 
+                              message: Optional[str] = None,
+                              chain_position: Optional[Dict[str, int]] = None,
+                              ctx: Optional[Context] = None) -> bool:
         """
         Update the status of an active request.
         
@@ -231,12 +232,15 @@ class ServerState:
             progress: Optional progress value between 0 and 1
             message: Optional status message
             chain_position: Optional dict with current and total position in agent chain
+            ctx: Optional Context object for progress reporting
             
         Returns:
             bool: True if update should be sent (respects throttling), False otherwise
         """
         if request_id not in self.active_requests:
             logger.warning(f"Attempted to update unknown request: {request_id}")
+            if ctx:
+                await ctx.error(f"Attempted to update unknown request: {request_id}")
             return False
         
         request = self.active_requests[request_id]
@@ -300,6 +304,30 @@ class ServerState:
             merge_similar=are_updates_similar
         )
         
+        # If we have a Context and should send an update, send it using the Context
+        if ctx and should_send and batched_updates:
+            # Send all batched updates
+            for update in batched_updates:
+                if is_final and update["status"] in ["completed", "failed", "canceled"]:
+                    # Send final status via context
+                    if update["status"] == "completed":
+                        await ctx.complete(update["message"])
+                    elif update["status"] == "failed":
+                        await ctx.error(update["message"])
+                    else:  # canceled
+                        await ctx.report_progress(
+                            current=update["progress"],
+                            total=1.0,
+                            message=f"Canceled: {update['message']}"
+                        )
+                else:
+                    # Send progress update via context
+                    await ctx.report_progress(
+                        current=update["progress"],
+                        total=1.0,
+                        message=update["message"]
+                    )
+        
         # Remember the last time we checked, regardless of whether we sent
         self.last_update_time[request_id] = current_time
             
@@ -317,8 +345,8 @@ class ServerState:
         """
         return self.active_requests.get(request_id)
     
-    def complete_request(self, request_id: str, status: str = "completed", 
-                        message: Optional[str] = None) -> Dict[str, Any]:
+    async def complete_request(self, request_id: str, status: str = "completed", 
+                         message: Optional[str] = None, ctx: Optional[Context] = None) -> Dict[str, Any]:
         """
         Mark a request as completed and return its final state.
         
@@ -326,23 +354,27 @@ class ServerState:
             request_id: The unique request ID
             status: Final status (completed, failed, or canceled)
             message: Optional final status message
+            ctx: Optional Context object for progress reporting
             
         Returns:
             Dict with final request information
         """
         if request_id not in self.active_requests:
             logger.warning(f"Attempted to complete unknown request: {request_id}")
+            if ctx:
+                await ctx.error(f"Attempted to complete unknown request: {request_id}")
             return {}
         
         # Get the current request info
         request = self.active_requests[request_id]
         
         # Update with final state
-        self.update_request_status(
+        await self.update_request_status(
             request_id=request_id,
             status=status,
             progress=1.0 if status == "completed" else request["progress"],
-            message=message or f"Request {status}"
+            message=message or f"Request {status}",
+            ctx=ctx
         )
         
         # Get the final state
@@ -469,20 +501,20 @@ async def update_agent_cache() -> None:
     logger.info(f"Agent cache updated with {len(state.cache)} agents")
 
 
-# Create the FastMCP server with support for both Streamable HTTP and SSE transports
+# Create the FastMCP server with FastMCP 2.0 style
 mcp = FastMCP(
     name="A2A MCP Server",
-    streaming_enabled=True,  # Enable streaming support
-    streaming_endpoint="/mcp",  # Single endpoint for bi-directional communication
-    connection_timeout=600.0,  # 10 minutes timeout for long-running operations
-    auto_reconnect=True,  # Enable automatic reconnection for dropped connections
-    max_reconnect_attempts=5,  # Maximum reconnection attempts
-    reconnect_delay=2.0  # Delay between reconnection attempts in seconds
+    settings=dict(
+        connection_timeout=600.0,  # 10 minutes timeout for long-running operations
+        auto_reconnect=True,  # Enable automatic reconnection for dropped connections
+        max_reconnect_attempts=5,  # Maximum reconnection attempts
+        reconnect_delay=2.0  # Delay between reconnection attempts in seconds
+    )
 )
 
 # Register tools
 @mcp.tool()
-async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: Optional[str] = None) -> Dict[str, Any]:
+async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: Optional[str] = None, ctx: Context) -> Dict[str, Any]:
     """
     Add or remove an A2A server URL.
     
@@ -490,6 +522,7 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
         action: Either "add" or "remove"
         name: Name of the server
         url: URL of the server (required for "add" action)
+        ctx: The FastMCP context for progress reporting
         
     Returns:
         Dict with status and message
@@ -500,16 +533,24 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
         
         if action == "add":
             if not url:
-                logger.warning("URL is required for add action")
-                return {"status": "error", "message": "URL is required for add action"}
+                error_msg = "URL is required for add action"
+                logger.warning(error_msg)
+                await ctx.error(error_msg)
+                return {"status": "error", "message": error_msg}
+            
+            await ctx.report_progress(current=0.2, total=1.0, message=f"Adding {name} to registry")
             
             # Add to registry
             state.registry[name] = url
             logger.info(f"Added A2A server: {name} -> {url}")
             logger.debug(f"Registry after: {state.registry}")
             
+            await ctx.report_progress(current=0.5, total=1.0, message=f"Updating agent cache")
+            
             # Update the cache asynchronously
             asyncio.create_task(update_agent_cache())
+            
+            await ctx.report_progress(current=1.0, total=1.0, message=f"Added A2A server: {name}")
             
             return {
                 "status": "success", 
@@ -519,6 +560,8 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
         
         elif action == "remove":
             if name in state.registry:
+                await ctx.report_progress(current=0.5, total=1.0, message=f"Removing {name} from registry")
+                
                 # Remove from registry
                 del state.registry[name]
                 
@@ -529,29 +572,39 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
                 logger.info(f"Removed A2A server: {name}")
                 logger.debug(f"Registry after: {state.registry}")
                 
+                await ctx.report_progress(current=1.0, total=1.0, message=f"Removed A2A server: {name}")
+                
                 return {
                     "status": "success", 
                     "message": f"Removed A2A server: {name}",
                     "registry": state.registry
                 }
             else:
-                logger.warning(f"Server {name} not found in registry")
+                error_msg = f"Server {name} not found in registry"
+                logger.warning(error_msg)
+                await ctx.error(error_msg)
                 return {
                     "status": "error", 
-                    "message": f"Server {name} not found in registry"
+                    "message": error_msg
                 }
         
+        error_msg = f"Invalid action: {action}. Use 'add' or 'remove'"
         logger.error(f"Invalid action: {action}")
-        return {"status": "error", "message": "Invalid action. Use 'add' or 'remove'"}
+        await ctx.error(error_msg)
+        return {"status": "error", "message": error_msg}
     except Exception as e:
         logger.exception(f"Error in a2a_server_registry: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 @mcp.tool()
-async def list_agents() -> Dict[str, Any]:
+async def list_agents(ctx: Context) -> Dict[str, Any]:
     """
     List available agents with their agent cards.
     
+    Args:
+        ctx: The FastMCP context for progress reporting
+        
     Returns:
         Dict with agents and their cards
     """
@@ -559,11 +612,34 @@ async def list_agents() -> Dict[str, Any]:
         logger.debug("list_agents called")
         logger.debug(f"Current registry: {state.registry}")
         
+        await ctx.report_progress(current=0.1, total=1.0, message="Retrieving list of registered agents")
+        
+        # If no agents are registered
+        if not state.registry:
+            await ctx.report_progress(current=1.0, total=1.0, message="No agents are registered")
+            return {
+                "agent_count": 0,
+                "agents": {},
+                "message": "No agents are registered. Use a2a_server_registry to add an agent."
+            }
+        
         # Directly fetch agent cards
         import httpx
         agents = {}
         
+        total_agents = len(state.registry)
+        current_agent = 0
+        
         for name, url in state.registry.items():
+            current_agent += 1
+            progress = 0.1 + (0.8 * (current_agent / total_agents))
+            
+            await ctx.report_progress(
+                current=progress, 
+                total=1.0, 
+                message=f"Fetching card for {name} ({current_agent}/{total_agents})"
+            )
+            
             try:
                 logger.debug(f"Fetching card for {name} from {url}")
                 
@@ -590,6 +666,8 @@ async def list_agents() -> Dict[str, Any]:
                 logger.exception(f"Error fetching card for {name}: {e}")
         
         # Update the cache with the fetched cards
+        await ctx.report_progress(current=0.9, total=1.0, message="Updating agent cache")
+        
         state.cache = {}
         for name, card_data in agents.items():
             try:
@@ -598,25 +676,30 @@ async def list_agents() -> Dict[str, Any]:
                 logger.exception(f"Error converting card data for {name}: {e}")
         
         logger.info(f"Listing {len(agents)} agents")
+        
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Found {len(agents)} agents")
+        
         return {
             "agent_count": len(agents),
             "agents": agents
         }
     except Exception as e:
         logger.exception(f"Error in list_agents: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 @mcp.tool()
-async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
+async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, Any]:
     """
     Call an agent with a prompt and stream progress updates.
     
     Args:
         agent_name: Name of the agent to call
         prompt: Prompt to send to the agent
+        ctx: The FastMCP context for progress reporting
         
     Returns:
-        Dict with initial response and status (streaming updates follow via connection upgrade)
+        Dict with status information
     """
     try:
         logger.debug(f"call_agent called with agent_name={agent_name}, prompt={prompt[:50]}...")
@@ -624,19 +707,16 @@ async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
         
         # Verify the agent exists
         if agent_name not in state.registry:
-            logger.warning(f"Agent '{agent_name}' not found in registry")
-            return {
-                "status": "error",
-                "message": f"Agent '{agent_name}' not found in registry"
-            }
+            error_msg = f"Agent '{agent_name}' not found in registry"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         # Get the URL for the agent
         url = state.registry[agent_name]
         logger.debug(f"Using URL: {url}")
         
         try:
-            # Create a client and send message directly via HTTP
-            import httpx
             import json
             import uuid
             
@@ -659,18 +739,19 @@ async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
                 session_id=session_id
             )
             
-            # Update initial status
-            state.update_request_status(
+            # Update initial status with context
+            await state.update_request_status(
                 request_id=mcp_request_id,
                 status="submitted",
-                message=f"Sending prompt to {agent_name}"
+                message=f"Sending prompt to {agent_name}",
+                ctx=ctx
             )
             
             # Prepare the JSON-RPC request using tasks/sendSubscribe for streaming updates
             json_rpc_request = {
                 "jsonrpc": "2.0",
                 "id": mcp_request_id,
-                "method": "tasks/sendSubscribe",  # Use streaming method
+                "method": "tasks/sendSubscribe",
                 "params": {
                     "id": task_id,
                     "sessionId": session_id,
@@ -688,134 +769,122 @@ async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
             
             logger.debug(f"Sending JSON-RPC request: {json.dumps(json_rpc_request)}")
             
-            # Create a background task to handle the streaming response
-            asyncio.create_task(
-                process_streaming_response(
-                    url=base_url,
-                    agent_name=agent_name,
-                    mcp_request_id=mcp_request_id,
-                    json_rpc_request=json_rpc_request
-                )
+            # Update status to working
+            await state.update_request_status(
+                request_id=mcp_request_id,
+                status="working",
+                message=f"Connected to {agent_name}, waiting for response...",
+                ctx=ctx
             )
             
-            # Respond immediately with a connection upgrade request
-            logger.debug(f"Returning connection upgrade request for {mcp_request_id}")
-            return {
-                "status": "upgrading_connection",
-                "message": f"Connecting to {agent_name} agent...",
-                "request_id": mcp_request_id,
-                "agent_name": agent_name,
-                "needs_upgrade": True,  # Signal to MCP that we need a connection upgrade
-                "streaming": True,      # Indicate that this is a streaming response
-                "final": False          # Indicate that more updates will follow
-            }
-        
+            # Send the request and process streaming responses
+            import httpx
+            
+            try:
+                async with httpx.AsyncClient(timeout=600.0) as client:
+                    async with client.stream(
+                        "POST",
+                        base_url,
+                        json=json_rpc_request,
+                        headers={"Content-Type": "application/json"},
+                        timeout=600.0  # 10 minutes timeout
+                    ) as response:
+                        logger.debug(f"Streaming response started with status code: {response.status_code}")
+                        
+                        if response.status_code != 200:
+                            error_text = await response.text()
+                            logger.error(f"Error response: HTTP {response.status_code}: {error_text}")
+                            
+                            await state.update_request_status(
+                                request_id=mcp_request_id,
+                                status="failed",
+                                message=f"HTTP error {response.status_code}: {error_text[:100]}...",
+                                ctx=ctx
+                            )
+                            
+                            return {
+                                "status": "error",
+                                "message": f"Error from agent: HTTP {response.status_code}",
+                                "request_id": mcp_request_id
+                            }
+                        
+                        # Process the streaming response
+                        buffer = ""
+                        async for chunk in response.aiter_text():
+                            buffer += chunk
+                            
+                            # Try to extract complete JSON objects from the buffer
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                if not line.strip():
+                                    continue
+                                
+                                try:
+                                    update = json.loads(line)
+                                    await process_agent_update(mcp_request_id, agent_name, update, ctx)
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"Error decoding JSON from chunk: {line[:100]}... - {e}")
+                        
+                        # Process any remaining data in the buffer
+                        if buffer.strip():
+                            try:
+                                update = json.loads(buffer)
+                                await process_agent_update(mcp_request_id, agent_name, update, ctx)
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Error decoding JSON from final chunk: {buffer[:100]}... - {e}")
+                        
+                        # Mark as completed if we haven't already
+                        request_info = state.get_request_info(mcp_request_id)
+                        if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
+                            await state.update_request_status(
+                                request_id=mcp_request_id,
+                                status="completed",
+                                progress=1.0,
+                                message=f"Completed response from {agent_name}",
+                                ctx=ctx
+                            )
+                
+                # Return the final status
+                return {
+                    "status": "success",
+                    "message": "Task completed",
+                    "request_id": mcp_request_id
+                }
+                
+            except Exception as e:
+                logger.exception(f"Error processing streaming response for {mcp_request_id}: {e}")
+                
+                # Update status to failed
+                await state.update_request_status(
+                    request_id=mcp_request_id,
+                    status="failed",
+                    message=f"Error: {str(e)}",
+                    ctx=ctx
+                )
+                
+                return {
+                    "status": "error",
+                    "message": f"Error processing response: {str(e)}",
+                    "request_id": mcp_request_id
+                }
+            
         except Exception as e:
             logger.exception(f"Error calling agent {agent_name}: {e}")
+            await ctx.error(f"Error calling agent: {str(e)}")
             return {
                 "status": "error",
                 "message": f"Error calling agent: {str(e)}"
             }
     except Exception as e:
         logger.exception(f"Error in call_agent: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 
-async def process_streaming_response(
-    url: str, 
-    agent_name: str, 
-    mcp_request_id: str, 
-    json_rpc_request: Dict[str, Any]
-) -> None:
-    """
-    Process streaming response from an A2A agent.
-    
-    Args:
-        url: The base URL of the agent
-        agent_name: The name of the agent
-        mcp_request_id: The MCP request ID
-        json_rpc_request: The JSON-RPC request to send
-    """
-    logger.debug(f"Starting streaming response processing for {mcp_request_id}")
-    
-    try:
-        import httpx
-        import json
-        
-        # Update status to working
-        state.update_request_status(
-            request_id=mcp_request_id,
-            status="working",
-            message=f"Connected to {agent_name}, waiting for response..."
-        )
-        
-        # Send the request and process streaming responses
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            async with client.stream(
-                "POST",
-                url,
-                json=json_rpc_request,
-                headers={"Content-Type": "application/json"},
-                timeout=600.0  # 10 minutes timeout
-            ) as response:
-                logger.debug(f"Streaming response started with status code: {response.status_code}")
-                
-                if response.status_code != 200:
-                    error_text = await response.text()
-                    logger.error(f"Error response: HTTP {response.status_code}: {error_text}")
-                    state.update_request_status(
-                        request_id=mcp_request_id,
-                        status="failed",
-                        message=f"HTTP error {response.status_code}: {error_text[:100]}..."
-                    )
-                    return
-                
-                # Process the streaming response
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    
-                    # Try to extract complete JSON objects from the buffer
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        if not line.strip():
-                            continue
-                        
-                        try:
-                            update = json.loads(line)
-                            await process_agent_update(mcp_request_id, agent_name, update)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Error decoding JSON from chunk: {line[:100]}... - {e}")
-                
-                # Process any remaining data in the buffer
-                if buffer.strip():
-                    try:
-                        update = json.loads(buffer)
-                        await process_agent_update(mcp_request_id, agent_name, update)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Error decoding JSON from final chunk: {buffer[:100]}... - {e}")
-                
-                # Mark as completed if we haven't already
-                request_info = state.get_request_info(mcp_request_id)
-                if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
-                    state.update_request_status(
-                        request_id=mcp_request_id,
-                        status="completed",
-                        progress=1.0,
-                        message=f"Completed response from {agent_name}"
-                    )
-    
-    except Exception as e:
-        logger.exception(f"Error processing streaming response for {mcp_request_id}: {e}")
-        # Update status to failed
-        state.update_request_status(
-            request_id=mcp_request_id,
-            status="failed",
-            message=f"Error: {str(e)}"
-        )
+# Streaming response processing is now handled directly in call_agent with Context
 
 
-async def process_agent_update(mcp_request_id: str, agent_name: str, update: Dict[str, Any]) -> None:
+async def process_agent_update(mcp_request_id: str, agent_name: str, update: Dict[str, Any], ctx: Context) -> None:
     """
     Process an update from an A2A agent.
     
@@ -823,6 +892,7 @@ async def process_agent_update(mcp_request_id: str, agent_name: str, update: Dic
         mcp_request_id: The MCP request ID
         agent_name: The name of the agent
         update: The update data from the agent
+        ctx: The FastMCP context for progress reporting
     """
     logger.debug(f"Processing agent update for {mcp_request_id}: {json.dumps(update)[:200]}...")
     
@@ -887,184 +957,35 @@ async def process_agent_update(mcp_request_id: str, agent_name: str, update: Dic
             artifact_names = [a.get("name", "unnamed") for a in artifacts]
             status_message = f"{agent_name} completed with {len(artifacts)} artifact(s): {', '.join(artifact_names)}"
     
-    # Update request status
-    should_send = state.update_request_status(
+    # Get chain position info (current agent in chain)
+    chain_position = {"current": 1, "total": 1}
+    
+    # Update request status with context
+    should_send = await state.update_request_status(
         request_id=mcp_request_id,
         status=mapped_state,
         progress=progress,
-        message=status_message
+        message=status_message,
+        chain_position=chain_position,
+        ctx=ctx
     )
     
     logger.debug(f"Updated request status for {mcp_request_id}: {mapped_state}, should_send={should_send}")
 
 
-async def handle_streaming_connection(request_id: str, connection) -> None:
-    """
-    Handle a streaming connection for a long-running task.
-    
-    Args:
-        request_id: The unique request ID
-        connection: The streaming connection object
-    """
-    logger.debug(f"Handling streaming connection for request_id: {request_id}")
-    
-    # Get the request info
-    request_info = state.get_request_info(request_id)
-    if not request_info:
-        logger.warning(f"No active request found for {request_id}")
-        await connection.send_json({
-            "status": "error",
-            "message": "No active request found",
-            "final": True
-        })
-        return
-    
-    # Send initial status
-    await connection.send_json({
-        "status": "connected",
-        "request_id": request_id,
-        "message": "Connection established for streaming updates",
-        "request_info": request_info,
-        "final": False
-    })
-    
-    # Set up times for heartbeat and checking for updates
-    last_heartbeat_time = time.time()
-    last_update_check = time.time()
-    
-    try:
-        # Main connection loop
-        while request_id in state.active_requests:
-            # Get the latest request info
-            current_info = state.get_request_info(request_id)
-            current_time = time.time()
-            
-            # Process any batched updates from the throttler
-            pending_updates = state.update_throttler.get_pending_updates(request_id)
-            if pending_updates and (current_time - last_update_check) >= 0.5:
-                last_update_check = current_time
-                last_heartbeat_time = current_time  # Reset heartbeat timer
-                
-                # Send all pending updates as a batch
-                for update in pending_updates:
-                    is_final = update["status"] in ["completed", "failed", "canceled"]
-                    
-                    await connection.send_json({
-                        "status": update["status"],
-                        "request_id": request_id,
-                        "message": update["message"],
-                        "timestamp": update["timestamp"],
-                        "progress": update["progress"],
-                        "chain_position": update["chain_position"],
-                        "final": is_final
-                    })
-                    
-                    # If this is a final update, we're done
-                    if is_final:
-                        logger.debug(f"Sent final update for request {request_id}")
-                        state.update_throttler.clear(request_id)
-                        return
-                
-                # Clear the updates since we've sent them
-                state.update_throttler.clear(request_id)
-            
-            # Send heartbeat every 30 seconds if no updates
-            if (current_time - last_heartbeat_time) >= 30.0:
-                await connection.send_json({
-                    "status": "heartbeat",
-                    "request_id": request_id,
-                    "timestamp": current_time,
-                    "final": False
-                })
-                last_heartbeat_time = current_time
-            
-            # Check for request completion or cancellation
-            if current_info.get("status") in ["completed", "failed", "canceled"]:
-                # Send final update
-                await connection.send_json({
-                    "status": current_info.get("status"),
-                    "request_id": request_id,
-                    "message": current_info.get("last_message"),
-                    "request_info": current_info,
-                    "final": True
-                })
-                logger.debug(f"Sent final update for request {request_id}")
-                break
-            
-            # Small delay to prevent busy waiting
-            await asyncio.sleep(0.1)
-    
-    except Exception as e:
-        logger.exception(f"Error in streaming connection for {request_id}: {e}")
-        try:
-            # Try to send error message
-            await connection.send_json({
-                "status": "error",
-                "message": f"Connection error: {str(e)}",
-                "final": True
-            })
-        except:
-            pass
-    
-    finally:
-        # Update request status if it's still active and not in a final state
-        if request_id in state.active_requests:
-            request_info = state.get_request_info(request_id)
-            if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
-                state.complete_request(
-                    request_id=request_id,
-                    status="canceled",
-                    message="Connection closed"
-                )
-                logger.debug(f"Marked request {request_id} as canceled due to connection closure")
-                
-        # Clear any pending updates
-        state.update_throttler.clear(request_id)
-
-
-async def handle_connection_upgrade(request_id: str) -> None:
-    """
-    Initiate a connection upgrade for a long-running task.
-    
-    Args:
-        request_id: The unique request ID
-    
-    Returns:
-        Dict with connection upgrade information
-    """
-    logger.debug(f"Initiating connection upgrade for request_id: {request_id}")
-    
-    # Get the request info
-    request_info = state.get_request_info(request_id)
-    if not request_info:
-        logger.warning(f"No active request found for {request_id}")
-        return {
-            "status": "error",
-            "message": "No active request found"
-        }
-    
-    # Return connection upgrade information
-    return {
-        "status": "upgrade_connection",
-        "request_id": request_id,
-        "message": "Initiating connection upgrade for streaming updates",
-        "upgrade_info": {
-            "protocol": "streamable_http",
-            "endpoint": "/mcp",
-            "request_id": request_id
-        }
-    }
+# FastMCP 2.0 handles connections via Context, so we don't need separate handler functions
 
 
 # Define new tool for sending additional input to an agent
 @mcp.tool()
-async def send_input(request_id: str, input_text: str) -> Dict[str, Any]:
+async def send_input(request_id: str, input_text: str, ctx: Context) -> Dict[str, Any]:
     """
     Send additional input to an agent that has requested it.
     
     Args:
         request_id: The unique request ID for the in-progress task
         input_text: The input text to send to the agent
+        ctx: The FastMCP context for progress reporting
         
     Returns:
         Dict with response information
@@ -1072,36 +993,37 @@ async def send_input(request_id: str, input_text: str) -> Dict[str, Any]:
     try:
         logger.debug(f"send_input called for request_id={request_id}, input={input_text[:50]}...")
         
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Verifying request {request_id}")
+        
         # Verify the request exists
         request_info = state.get_request_info(request_id)
         if not request_info:
+            error_msg = f"No active request found with ID: {request_id}"
             logger.warning(f"No active request found for {request_id}")
-            return {
-                "status": "error",
-                "message": f"No active request found with ID: {request_id}"
-            }
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         # Verify the request is in the input-required state
         current_status = request_info.get("status", "unknown")
         if current_status != "input-required":
+            error_msg = f"Request {request_id} is not waiting for input (status: {current_status})"
             logger.warning(f"Request {request_id} is not in input-required state (status: {current_status})")
-            return {
-                "status": "error",
-                "message": f"Request {request_id} is not waiting for input (status: {current_status})"
-            }
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         # Get the agent information
         agent_name = request_info.get("agent_name", "unknown")
         task_id = request_info.get("task_id", "unknown")
         session_id = request_info.get("session_id", "unknown")
         
+        await ctx.report_progress(current=0.2, total=1.0, message=f"Preparing to send input to {agent_name}")
+        
         # Get the URL for the agent
         if agent_name not in state.registry:
-            logger.warning(f"Agent '{agent_name}' not found in registry")
-            return {
-                "status": "error",
-                "message": f"Agent '{agent_name}' not found in registry"
-            }
+            error_msg = f"Agent '{agent_name}' not found in registry"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         url = state.registry[agent_name]
         
@@ -1134,11 +1056,14 @@ async def send_input(request_id: str, input_text: str) -> Dict[str, Any]:
         logger.debug(f"Sending input request: {json.dumps(json_rpc_request)}")
         
         # Update status to working
-        state.update_request_status(
+        await state.update_request_status(
             request_id=request_id,
             status="working",
-            message=f"Sent additional input to {agent_name}, waiting for response..."
+            message=f"Sent additional input to {agent_name}, waiting for response...",
+            ctx=ctx
         )
+        
+        await ctx.report_progress(current=0.5, total=1.0, message=f"Sending input to {agent_name}")
         
         # Send the input request
         import httpx
@@ -1161,49 +1086,52 @@ async def send_input(request_id: str, input_text: str) -> Dict[str, Any]:
                     status_data = task_data.get("status", {})
                     task_state = status_data.get("state", "working")
                     
+                    await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully sent input to {agent_name}")
+                    
+                    # Process the first update from the agent with the context
+                    await process_agent_update(request_id, agent_name, json_response, ctx)
+                    
                     return {
                         "status": "success",
                         "message": f"Successfully sent input to {agent_name}",
                         "task_state": task_state,
-                        "needs_upgrade": True,  # Signal that we need to continue streaming updates
-                        "streaming": True,
-                        "final": False,
                         "request_id": request_id
                     }
                 except json.JSONDecodeError as e:
                     logger.exception(f"Error decoding JSON response: {e}")
-                    return {
-                        "status": "error",
-                        "message": f"Error decoding response: {str(e)}"
-                    }
+                    error_msg = f"Error decoding response: {str(e)}"
+                    await ctx.error(error_msg)
+                    return {"status": "error", "message": error_msg}
             else:
                 error_text = await response.text()
+                error_msg = f"Error sending input: HTTP {response.status_code}"
                 logger.error(f"Error sending input: HTTP {response.status_code}: {error_text}")
                 
                 # Update status back to input-required since the input failed
-                state.update_request_status(
+                await state.update_request_status(
                     request_id=request_id,
                     status="input-required",
-                    message=f"Error sending input to {agent_name}: HTTP {response.status_code}"
+                    message=f"Error sending input to {agent_name}: HTTP {response.status_code}",
+                    ctx=ctx
                 )
                 
-                return {
-                    "status": "error",
-                    "message": f"Error sending input: HTTP {response.status_code}"
-                }
+                await ctx.error(error_msg)
+                return {"status": "error", "message": error_msg}
     
     except Exception as e:
         logger.exception(f"Error in send_input: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 # Define new tool for cancellation
 @mcp.tool()
-async def cancel_request(request_id: str) -> Dict[str, Any]:
+async def cancel_request(request_id: str, ctx: Context) -> Dict[str, Any]:
     """
     Cancel an in-progress agent request.
     
     Args:
         request_id: The unique request ID to cancel
+        ctx: The FastMCP context for progress reporting
         
     Returns:
         Dict with status information
@@ -1211,27 +1139,29 @@ async def cancel_request(request_id: str) -> Dict[str, Any]:
     try:
         logger.debug(f"cancel_request called for request_id={request_id}")
         
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Verifying request {request_id}")
+        
         # Verify the request exists
         request_info = state.get_request_info(request_id)
         if not request_info:
+            error_msg = f"No active request found with ID: {request_id}"
             logger.warning(f"No active request found for {request_id}")
-            return {
-                "status": "error",
-                "message": f"No active request found with ID: {request_id}"
-            }
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         # Get the agent information
         agent_name = request_info.get("agent_name", "unknown")
         task_id = request_info.get("task_id", "unknown")
         session_id = request_info.get("session_id", "unknown")
         
+        await ctx.report_progress(current=0.3, total=1.0, message=f"Preparing to cancel request to {agent_name}")
+        
         # Get the URL for the agent
         if agent_name not in state.registry:
-            logger.warning(f"Agent '{agent_name}' not found in registry")
-            return {
-                "status": "error",
-                "message": f"Agent '{agent_name}' not found in registry"
-            }
+            error_msg = f"Agent '{agent_name}' not found in registry"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
         
         url = state.registry[agent_name]
         logger.debug(f"Using URL for cancel: {url}")
@@ -1255,6 +1185,8 @@ async def cancel_request(request_id: str) -> Dict[str, Any]:
         
         logger.debug(f"Sending cancel request: {json.dumps(json_rpc_request)}")
         
+        await ctx.report_progress(current=0.5, total=1.0, message=f"Sending cancellation request to {agent_name}")
+        
         # Send the cancel request
         import httpx
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1268,18 +1200,15 @@ async def cancel_request(request_id: str) -> Dict[str, Any]:
             
             if response.status_code == 200:
                 # Update our local state
-                state.update_request_status(
+                await state.update_request_status(
                     request_id=request_id,
                     status="canceled",
-                    message=f"Request to {agent_name} was canceled by the user"
+                    message=f"Request to {agent_name} was canceled by the user",
+                    ctx=ctx
                 )
                 
-                # Complete the request
-                state.complete_request(
-                    request_id=request_id,
-                    status="canceled",
-                    message=f"Request to {agent_name} was canceled by the user"
-                )
+                # Mark as completed in Context
+                await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully canceled request {request_id}")
                 
                 return {
                     "status": "success",
@@ -1287,19 +1216,19 @@ async def cancel_request(request_id: str) -> Dict[str, Any]:
                 }
             else:
                 error_text = await response.text()
+                error_msg = f"Error canceling request: HTTP {response.status_code}"
                 logger.error(f"Error canceling request: HTTP {response.status_code}: {error_text}")
-                return {
-                    "status": "error",
-                    "message": f"Error canceling request: HTTP {response.status_code}"
-                }
+                await ctx.error(error_msg)
+                return {"status": "error", "message": error_msg}
     
     except Exception as e:
         logger.exception(f"Error in cancel_request: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 # Define tool for exporting execution logs
 @mcp.tool()
-async def export_logs(request_id: str, format_type: Literal["text", "json"] = "text", file_path: Optional[str] = None) -> Dict[str, Any]:
+async def export_logs(request_id: str, format_type: Literal["text", "json"] = "text", file_path: Optional[str] = None, ctx: Context) -> Dict[str, Any]:
     """
     Export execution logs for a request, optionally saving to a file.
     
@@ -1307,6 +1236,7 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
         request_id: The unique request ID
         format_type: Output format (text or json)
         file_path: Optional file path to save the log to
+        ctx: The FastMCP context for progress reporting
         
     Returns:
         Dict with the log data or file path
@@ -1314,20 +1244,25 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
     try:
         logger.debug(f"export_logs called for request_id={request_id}, format={format_type}")
         
+        await ctx.report_progress(current=0.1, total=1.0, message=f"Retrieving logs for request {request_id}")
+        
         # Check if the request exists or existed
         log_entries = state.get_execution_log(request_id)
         if not log_entries:
+            error_msg = f"No log entries found for request ID: {request_id}"
             logger.warning(f"No log entries found for {request_id}")
-            return {
-                "status": "error",
-                "message": f"No log entries found for request ID: {request_id}"
-            }
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
+        
+        await ctx.report_progress(current=0.4, total=1.0, message=f"Formatting {len(log_entries)} log entries as {format_type}")
         
         # Format the log
         formatted_log = state.export_execution_log(request_id, format_type)
         
         # If a file path is provided, save the log to file
         if file_path:
+            await ctx.report_progress(current=0.7, total=1.0, message=f"Saving log to {file_path}")
+            
             try:
                 # Ensure the directory exists
                 os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
@@ -1336,6 +1271,7 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
                 with open(file_path, 'w') as f:
                     f.write(formatted_log)
                 
+                await ctx.report_progress(current=1.0, total=1.0, message=f"Log exported to {file_path}")
                 return {
                     "status": "success",
                     "message": f"Log exported to {file_path}",
@@ -1343,6 +1279,7 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
                 }
             except Exception as e:
                 logger.exception(f"Error writing log to file {file_path}: {e}")
+                await ctx.error(f"Error writing log to file: {str(e)}")
                 return {
                     "status": "error",
                     "message": f"Error writing log to file: {str(e)}",
@@ -1350,6 +1287,7 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
                 }
         
         # Return the formatted log
+        await ctx.report_progress(current=1.0, total=1.0, message=f"Exported {len(log_entries)} log entries")
         return {
             "status": "success",
             "log": formatted_log,
@@ -1359,19 +1297,25 @@ async def export_logs(request_id: str, format_type: Literal["text", "json"] = "t
     
     except Exception as e:
         logger.exception(f"Error in export_logs: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 # Define tool for listing active requests
 @mcp.tool()
-async def list_requests() -> Dict[str, Any]:
+async def list_requests(ctx: Context) -> Dict[str, Any]:
     """
     List all active requests.
     
+    Args:
+        ctx: The FastMCP context for progress reporting
+        
     Returns:
         Dict with active requests information
     """
     try:
         logger.debug("list_requests called")
+        
+        await ctx.report_progress(current=0.3, total=1.0, message="Retrieving active requests")
         
         # Get active request IDs
         active_requests = {}
@@ -1387,6 +1331,9 @@ async def list_requests() -> Dict[str, Any]:
                 "update_count": len(request_info.get("updates", []))
             }
         
+        count_message = f"Found {len(active_requests)} active requests"
+        await ctx.report_progress(current=1.0, total=1.0, message=count_message)
+        
         return {
             "status": "success",
             "request_count": len(active_requests),
@@ -1395,11 +1342,10 @@ async def list_requests() -> Dict[str, Any]:
     
     except Exception as e:
         logger.exception(f"Error in list_requests: {str(e)}")
+        await ctx.error(f"Error: {str(e)}")
         return {"status": "error", "message": f"Error: {str(e)}"}
 
-# Register connection handlers with MCP
-mcp.register_connection_handler(handle_streaming_connection)
-mcp.register_upgrade_handler(handle_connection_upgrade)
+# FastMCP 2.0 handles connections via Context, so we don't need to register handlers
 
 
 def main():
@@ -1409,7 +1355,22 @@ def main():
 
 def main_cli():
     """CLI entry point for running the server."""
-    mcp.run()
+    # Get transport from environment variable or use stdio as default
+    import os
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="A2A MCP Server")
+    parser.add_argument(
+        "--transport", 
+        choices=["stdio", "http"], 
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
+        help="Transport mode for the server (stdio or http)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Run the server with specified transport
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":
