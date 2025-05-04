@@ -1,0 +1,49 @@
+# Python package files
+*.egg-info/
+__pycache__/
+
+# Specific Python files
+client.py
+demo.py
+
+# Shell scripts
+install_and_test.sh
+
+# Dependency lock files
+uv.lock
+
+# Byte-compiled / optimized / DLL files
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/

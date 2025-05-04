@@ -28,14 +28,20 @@ logger = logging.getLogger(__name__)
 # MCP imports
 from mcp.server.fastmcp import FastMCP
 
-# A2A imports
-from a2a_min import A2aMinClient
-from a2a_min.base.client.card_resolver import A2ACardResolver
-from a2a_min.base.types import AgentCard, Message, TextPart, TaskSendParams
+# A2A imports - using python-a2a for better compatibility
+from python_a2a import A2AClient, AgentNetwork
+from python_a2a.models.agent import AgentCard
+from python_a2a.models.message import Message
+from python_a2a.models.content import TextContent
+from python_a2a.models.task import Task
 
 # Create a class to store persistent state
 class ServerState:
     def __init__(self):
+        # Use AgentNetwork for better management and discovery capabilities
+        # Initialize with just the name, agents will be added later
+        self.agent_network = AgentNetwork(name="A2A MCP Server Network")
+        # For backward compatibility
         self.registry = {}  # name -> url
         self.cache = {}  # name -> AgentCard
 
@@ -44,18 +50,27 @@ state = ServerState()
 
 
 async def fetch_agent_card(url: str) -> Optional[AgentCard]:
-    """Fetch agent card from an A2A server using A2ACardResolver."""
+    """Fetch agent card from an A2A server using the python-a2a client library.
+    
+    The python-a2a library has robust handling for agent card discovery with multiple fallback mechanisms:
+    - Tries multiple endpoints (/agent.json and /a2a/agent.json)
+    - Handles different response types (JSON and HTML)
+    - Follows redirects when needed
+    """
     try:
         logger.debug(f"Fetching agent card from {url}")
         
-        # Use the A2ACardResolver from a2a_min to get the agent card
-        card_resolver = A2ACardResolver(url)
-        try:
-            card = card_resolver.get_agent_card()
-            logger.debug(f"Received agent card: {card}")
-            return card
-        except Exception as e:
-            logger.error(f"Failed to fetch agent card: {str(e)}")
+        # Create a client that will automatically fetch the agent card
+        # The A2AClient constructor handles all the agent card resolution
+        # including trying multiple endpoints and following redirects
+        client = A2AClient(url)
+        
+        # Extract the agent card from the client
+        if client.agent_card:
+            logger.debug(f"Successfully fetched agent card: {client.agent_card}")
+            return client.agent_card
+        else:
+            logger.error(f"Failed to fetch agent card from {url}")
             return None
                 
     except Exception as e:
@@ -104,13 +119,20 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
                 logger.warning("URL is required for add action")
                 return {"status": "error", "message": "URL is required for add action"}
             
-            # Add to registry
+            # Add to registry for backward compatibility
             state.registry[name] = url
+            
+            # Add to agent network - this will automatically fetch the agent card
+            # The methods are synchronous in python-a2a
+            state.agent_network.add(name, url)
+            
             logger.info(f"Added A2A server: {name} -> {url}")
             logger.debug(f"Registry after: {state.registry}")
             
-            # Update the cache asynchronously
-            asyncio.create_task(update_agent_cache())
+            # Get the freshly fetched agent card and update our cache too
+            agent = state.agent_network.get_agent(name)
+            if agent and agent.agent_card:
+                state.cache[name] = agent.agent_card
             
             return {
                 "status": "success", 
@@ -120,12 +142,16 @@ async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: 
         
         elif action == "remove":
             if name in state.registry:
-                # Remove from registry
+                # Remove from registry for backward compatibility
                 del state.registry[name]
                 
                 # Remove from cache if present
                 if name in state.cache:
                     del state.cache[name]
+                
+                # Remove from agent network
+                if name in state.agent_network.agents:
+                    state.agent_network.remove(name)
                 
                 logger.info(f"Removed A2A server: {name}")
                 logger.debug(f"Registry after: {state.registry}")
@@ -160,23 +186,28 @@ async def list_agents() -> Dict[str, Any]:
         logger.debug("list_agents called")
         logger.debug(f"Current registry: {state.registry}")
         
-        # Use the A2ACardResolver to fetch agent cards
+        # Use AgentNetwork to get all agents
         agents = {}
         
-        for name, url in state.registry.items():
+        # Get agent information from the AgentNetwork
+        # The method is synchronous in python-a2a
+        agent_list = state.agent_network.list_agents()
+        logger.debug(f"Got agent list from network: {agent_list}")
+        
+        for agent_info in agent_list:
             try:
-                logger.debug(f"Fetching card for {name} from {url}")
-                card = await fetch_agent_card(url)
+                name = agent_info['name']
+                # Store the agent info in a format suitable for JSON response
+                agents[name] = agent_info
                 
-                if card:
-                    # Store the card data in a format suitable for JSON response
-                    agents[name] = card.model_dump()
-                    # Update the cache with the fetched card
-                    state.cache[name] = card
-                else:
-                    logger.error(f"Failed to fetch agent card for {name}")
+                # Also update our registry and cache for backward compatibility
+                if 'url' in agent_info:
+                    state.registry[name] = agent_info['url']
+                if 'agent_card' in agent_info:
+                    state.cache[name] = agent_info['agent_card']
+                    
             except Exception as e:
-                logger.exception(f"Error fetching card for {name}: {e}")
+                logger.exception(f"Error processing agent info: {e}")
         
         logger.info(f"Listing {len(agents)} agents")
         return {
@@ -203,100 +234,57 @@ async def call_agent(agent_name: str, prompt: str) -> Dict[str, Any]:
         logger.debug(f"call_agent called with agent_name={agent_name}, prompt={prompt[:50]}...")
         logger.debug(f"Current registry: {state.registry}")
         
-        # Verify the agent exists
-        if agent_name not in state.registry:
-            logger.warning(f"Agent '{agent_name}' not found in registry")
+        # Verify the agent exists in the network
+        if agent_name not in state.agent_network.agents:
+            logger.warning(f"Agent '{agent_name}' not found in agent network")
             return {
                 "status": "error",
-                "message": f"Agent '{agent_name}' not found in registry"
+                "message": f"Agent '{agent_name}' not found in agent network"
             }
         
-        # Get the URL for the agent
-        url = state.registry[agent_name]
-        logger.debug(f"Using URL: {url}")
-        
         try:
-            # Get or create agent card if needed
-            if agent_name not in state.cache:
-                logger.debug(f"Agent card not in cache, fetching for {agent_name}")
-                card = await fetch_agent_card(url)
-                if card:
-                    state.cache[agent_name] = card
-                else:
-                    logger.error(f"Failed to fetch agent card for {agent_name}")
-                    return {
-                        "status": "error",
-                        "message": f"Failed to fetch agent card for {agent_name}"
-                    }
+            # Get the agent directly from the network
+            logger.debug(f"Getting agent {agent_name} from the network")
+            client = state.agent_network.get_agent(agent_name)
             
-            # Create a client using A2aMinClient
+            if not client:
+                logger.error(f"Failed to get agent client for {agent_name}")
+                return {
+                    "status": "error",
+                    "message": f"Failed to get agent client for {agent_name}"
+                }
+                
+            # The client is already connected and ready to use
+            logger.debug(f"Successfully retrieved agent client for {agent_name}")
+            
             try:
-                # Connect to the A2A server
-                logger.debug(f"Connecting to A2A server at {url}")
-                client = A2aMinClient.connect(url)
                 
                 # Prepare message and send
                 logger.debug(f"Sending message to agent {agent_name}: {prompt[:50]}...")
-                task_id = str(uuid.uuid4())
-                session_id = str(uuid.uuid4())
                 
                 # Send the message and get response
-                task = await client.send_message(
-                    message=prompt,
-                    task_id=task_id,
-                    session_id=session_id
-                )
+                # The python-a2a client's ask method is not async
+                logger.debug(f"Using python-a2a client to ask: {prompt}")
+                response = client.ask(prompt)
                 
                 # Process and return the response
-                logger.debug(f"Received task response: {task}")
+                logger.debug(f"Received response: {response}")
                 
+                # The python-a2a client's ask() method returns a simple string response
+                # This makes handling much simpler
                 response_data = {
                     "status": "success",
-                    "task_id": task.id,
-                    "state": task.status.state if hasattr(task, 'status') else "unknown",
-                    "artifacts": []
+                    "response": response
                 }
-                
-                # Extract artifacts
-                artifacts = task.artifacts if hasattr(task, 'artifacts') else []
-                if artifacts:
-                    logger.debug(f"Received {len(artifacts)} artifacts")
-                    for artifact in artifacts:
-                        artifact_data = {
-                            "name": artifact.name,
-                            "content": []
-                        }
-                        
-                        for part in artifact.parts:
-                            part_type = part.type
-                            if part_type == "text":
-                                artifact_data["content"].append({
-                                    "type": "text", 
-                                    "text": part.text
-                                })
-                            elif part_type == "file":
-                                file_data = part.file
-                                artifact_data["content"].append({
-                                    "type": "file", 
-                                    "name": file_data.name,
-                                    "mime_type": file_data.mimeType
-                                })
-                            elif part_type == "data":
-                                artifact_data["content"].append({
-                                    "type": "data", 
-                                    "data": part.data
-                                })
-                        
-                        response_data["artifacts"].append(artifact_data)
                 
                 logger.info(f"Successfully called agent {agent_name}")
                 return response_data
                 
             except Exception as e:
-                logger.exception(f"Error using A2aMinClient: {e}")
+                logger.exception(f"Error using A2AClient: {e}")
                 return {
                     "status": "error",
-                    "message": f"Error calling agent with A2aMinClient: {str(e)}"
+                    "message": f"Error calling agent with A2AClient: {str(e)}"
                 }
         
         except Exception as e:
