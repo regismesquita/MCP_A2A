@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a_mcp_server"
+version = "0.1.0"
+description = "MCP server for A2A agent registry and communication"
+authors = [
+    {name = "A2A MCP Team"}
+]
+readme = "README.md"
+requires-python = ">=3.12.2"
+dependencies = [
+    "mcp",
+    "a2a_min",
+]
+
+[project.scripts]
+a2a-mcp-server = "a2a_mcp_server.server:main_cli"
+
+[tool.setuptools]
+packages = ["a2a_mcp_server"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+select = ["E", "F", "I", "W"]
+ignore = []
