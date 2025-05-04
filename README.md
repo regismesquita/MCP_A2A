@@ -1,6 +1,9 @@
 # A2A MCP Server
 
 A simple MCP server that provides Claude Desktop access to A2A protocol agents.
+> Developer friendly more than production ready, you can hack it to adapt to your needs and expand on whatever you need.
+> But probably not the best idea to deploy into prod as-is.
+
 
 ## Overview
 
