@@ -1,0 +1,10 @@
+fastmcp>=2.0.0
+a2a_min
+
+[test]
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.10.0
+pytest-timeout>=2.1.0
+pytest-cov>=4.1.0
+respx>=0.20.0

@@ -1,0 +1,498 @@
+Metadata-Version: 2.4
+Name: a2a_mcp_server
+Version: 0.1.0
+Summary: MCP server for A2A agent registry and communication
+Author: A2A MCP Team
+Requires-Python: >=3.12.2
+Description-Content-Type: text/markdown
+Requires-Dist: fastmcp>=2.0.0
+Requires-Dist: a2a_min
+Provides-Extra: test
+Requires-Dist: pytest>=8.0.0; extra == "test"
+Requires-Dist: pytest-asyncio>=0.23.0; extra == "test"
+Requires-Dist: pytest-mock>=3.10.0; extra == "test"
+Requires-Dist: pytest-timeout>=2.1.0; extra == "test"
+Requires-Dist: pytest-cov>=4.1.0; extra == "test"
+Requires-Dist: respx>=0.20.0; extra == "test"
+
+# A2A MCP Server
+
+A Model Context Protocol (MCP) server that provides Claude Desktop and other MCP clients access to A2A protocol agents with real-time progress visibility.
+> Developer friendly more than production ready, you can hack it to adapt to your needs and expand on whatever you need.
+> But probably not the best idea to deploy into prod as-is.
+
+## Transport Modes
+
+The server supports two transport modes:
+- **STDIO**: For use with Claude Desktop and other MCP clients that use STDIO transport
+- **HTTP**: For use with HTTP-based MCP clients
+
+You can specify the transport mode using the `--transport` command-line argument or the `MCP_TRANSPORT` environment variable.
+
+## Architecture Overview
+
+This project creates a bridge between Claude Desktop and agents implementing the A2A (Agent-to-Agent) protocol, with real-time streaming of execution progress.
+
+```ascii
+┌───────────────────┐      ┌────────────────────────┐      ┌────────────────────┐
+│                   │      │                        │      │                    │
+│  MCP Client       │◄────►│  A2A MCP Server Bridge │◄────►│  A2A Protocol      │
+│  (Claude Desktop  │      │  (This Project)        │      │  Agents            │
+│   or other)       │      │                        │      │                    │
+└───────────────────┘      └────────────────────────┘      └────────────────────┘
+       ▲                     ▲     │
+       │                     │     │ 
+       │                     │     │ FastMCP 2.0 Context
+       │                     │     │ (Progress Updates)
+       │ STDIO or HTTP       │     ▼
+       │ Transport           │  ┌────────────────────────┐
+       │                     │  │                        │
+       └─────────────────────┘  │  Agent Registry        │
+                                │  (In-memory state)     │
+                                │                        │
+                                └────────────────────────┘
+```
+
+## Real-Time Progress Visibility
+
+Unlike simpler implementations, this server provides streaming progress updates during agent execution:
+
+```ascii
+┌─ Progress Streaming Implementation ───────────────────────────────────────┐
+│                                                                           │
+│  MCP      ◄───┐                                                           │
+│  Client        │                                                           │
+│               │ STDIO or                                                  │
+│               │ HTTP Transport                                            │
+│  A2A MCP      │                                                           │
+│  Server  ─────┘                  ┌──────────────────┐                     │
+│    │                             │ UpdateThrottler  │ ◄────┐              │
+│    │                             │ - Rate limiting  │      │              │
+│    ▼                             │ - Batching       │      │              │
+│  Agent  ───────────────────────► │ - Prioritization │      │              │
+│                                  └──────────────────┘      │              │
+│                                          │                 │              │
+│                                          ▼                 │              │
+│                            ┌─────────────────────────┐     │              │
+│                            │ FastMCP 2.0 Context     │     │              │
+│                            │ - report_progress()     │─────┘              │
+│                            │ - complete()            │                    │
+│                            │ - error()               │                    │
+│                            └─────────────────────────┘                    │
+│                                          │                                │
+│                                          ▼                                │
+│                                  ┌──────────────────┐                     │
+│                                  │ Progress Updates │                     │
+│                                  │ - Status changes │                     │
+│                                  │ - % completion   │                     │
+│                                  │ - Chain position │                     │
+│                                  │ - Agent messages │                     │
+│                                  └──────────────────┘                     │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+## Multi-Agent Workflow
+
+The server can orchestrate interactions between multiple agents in a chain while providing real-time visibility:
+
+```ascii
+┌─ Multi-Agent Workflow ──────────────────────────────────────────────────┐
+│                                                                         │
+│  ┌───────────┐                                                          │
+│  │           │                                                          │
+│  │  Claude   │◄────────── User Input: "Process this text"               │
+│  │  Desktop  │                                                          │
+│  │           │                                                          │
+│  └─────┬─────┘                                                          │
+│        │                                                                │
+│        │ MCP Protocol + SSE                                             │
+│        ▼                                                                │
+│  ┌─────────────┐    ┌─ Progress Updates ───┐    ┌─ Request Tracking ─┐  │
+│  │             │    │ "Working: 10%"       │    │ request_id: uuid   │  │
+│  │  A2A MCP    │◄───┤ "Working: 20%"       │◄───┤ status: working    │  │
+│  │  Server     │    │ "Working: 30%"       │    │ agent: processor   │  │
+│  │             │    │ "Need more input..." │    │ position: 1/2      │  │
+│  └─────┬───────┘    └─────────────────────┘    └──────────────────┬──┘  │
+│        │                                                          │     │
+│        │ JSON-RPC + SSE                                           │     │
+│        ▼                                                          │     │
+│  ┌─────────────┐                                                  │     │
+│  │ Agent 1:    │                                                  │     │
+│  │ Processor   │──────────── Progress Updates ─────────────────────     │
+│  └─────┬───────┘                                                        │
+│        │                                                                │
+│        │ Intermediate Results                                           │
+│        ▼                                                                │
+│  ┌─────────────┐    ┌─ Progress Updates ───┐    ┌─ Request Tracking ─┐  │
+│  │             │    │ "Working: 20%"       │    │ request_id: uuid   │  │
+│  │  A2A MCP    │◄───┤ "Working: 40%"       │◄───┤ status: working    │  │
+│  │  Server     │    │ "Working: 60%"       │    │ agent: finalizer   │  │
+│  │             │    │ "Working: 80%"       │    │ position: 2/2      │  │
+│  └─────┬───────┘    └─────────────────────┘    └──────────────────┬──┘  │
+│        │                                                          │     │
+│        │ JSON-RPC + SSE                                           │     │
+│        ▼                                                          │     │
+│  ┌─────────────┐                                                  │     │
+│  │ Agent 2:    │                                                  │     │
+│  │ Finalizer   │──────────── Progress Updates ─────────────────────     │
+│  └─────┬───────┘                                                        │
+│        │                                                                │
+│        │ Final Results                                                  │
+│        ▼                                                                │
+│  ┌─────────────┐                                                        │
+│  │             │                                                        │
+│  │  A2A MCP    │                                                        │
+│  │  Server     │                                                        │
+│  │             │                                                        │
+│  └─────┬───────┘                                                        │
+│        │                                                                │
+│        │ Combined Results + Progress History                            │
+│        ▼                                                                │
+│  ┌───────────┐                                                          │
+│  │           │                                                          │
+│  │  Claude   │───────────► Final Response with execution details        │
+│  │  Desktop  │                                                          │
+│  │           │                                                          │
+│  └───────────┘                                                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Features
+
+- **Agent Registry**: Register and manage A2A protocol servers
+- **Agent Discovery**: List available agents with their capabilities
+- **Progress Visibility**: Real-time status updates during agent execution
+- **Multi-Agent Chains**: View progress across agent chains with position information
+- **Pipeline Orchestration**: Define and execute complex multi-agent workflows using JSON
+- **User Interaction**: Support for input requests and task cancellation
+- **Execution Logging**: Save and export detailed logs of agent executions
+- **Reusable Templates**: Save pipeline definitions as templates for easy reuse
+
+## Technical Architecture
+
+```ascii
+┌─ A2A MCP Server Architecture ────────────────────────────────────────────┐
+│                                                                          │
+│  ┌─ Core Components ───────────────────┐  ┌─ Communication ─────────────┐│
+│  │                                     │  │                             ││
+│  │  ● ServerState                      │  │  ● FastMCP 2.0 Context      ││
+│  │    - registry (name → url)          │  │    for progress reporting   ││
+│  │    - cache (name → AgentCard)       │  │  ● STDIO and HTTP transports││
+│  │    - active_requests                │  │  ● a2a_min client library   ││
+│  │    - execution_logs                 │  │    for A2A protocol         ││
+│  │    - update_throttler               │  │    communication            ││
+│  │    - pipelines                      │  │  ● Throttling mechanism     ││
+│  │    - pipeline_templates             │  │                             ││
+│  │                                     │  │                             ││
+│  └─────────────────────────────────────┘  └─────────────────────────────┘│
+│                                                                          │
+│  ┌─ MCP Tools ──────────────────────────────────────────────────────────┐│
+│  │                                                                      ││
+│  │  Agent Management:                     Pipeline Management:          ││
+│  │  1. a2a_server_registry                8. execute_pipeline           ││
+│  │  2. list_agents                        9. get_pipeline_status        ││
+│  │  3. call_agent                         10. cancel_pipeline           ││
+│  │  4. cancel_request                     11. send_pipeline_input       ││
+│  │  5. send_input                         12. save_pipeline_template    ││
+│  │  6. export_logs                        13. list_pipeline_templates   ││
+│  │  7. list_requests                      14. execute_pipeline_from_    ││
+│  │                                            template                  ││
+│  │                                        15. list_pipelines            ││
+│  └──────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  ┌─ Performance ────────────────────────┐  ┌─ Error Handling ───────────┐│
+│  │                                      │  │                            ││
+│  │  ● Update throttling                 │  │  ● Context-based error     ││
+│  │  ● Batch processing                  │  │    handling                ││
+│  │  ● Rate limiting                     │  │  ● Detailed logging        ││
+│  │  ● Progress prioritization           │  │  ● Error state tracking    ││
+│  │  ● Similar update merging            │  │  ● Client notifications    ││
+│  │                                      │  │                            ││
+│  └──────────────────────────────────────┘  └────────────────────────────┘│
+│                                                                          │
+│  ┌─ Pipeline Orchestration ───────────────────────────────────────────┐  │
+│  │                                                                     │  │
+│  │  ● JSON-based declarative pipeline definitions                      │  │
+│  │  ● Dependency-aware node execution                                  │  │
+│  │  ● Input/output mapping between agents                              │  │
+│  │  ● Configurable error policies                                      │  │
+│  │  ● Real-time progress tracking at node and pipeline levels          │  │
+│  │  ● Reusable pipeline templates                                      │  │
+│  │                                                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Tools
+
+The server provides multiple MCP tools for agent and pipeline management:
+
+### Agent Management Tools
+
+1. **a2a_server_registry** - Register or remove A2A servers
+   ```json
+   {
+     "action": "add", 
+     "name": "processor", 
+     "url": "http://localhost:8001"
+   }
+   ```
+
+2. **list_agents** - List all registered agents with their capabilities
+   ```json
+   {}
+   ```
+
+3. **call_agent** - Send a prompt to an agent and get streaming responses
+   ```json
+   {
+     "agent_name": "processor",
+     "prompt": "Process this text with detailed progress visibility"
+   }
+   ```
+
+4. **cancel_request** - Cancel an in-progress agent task
+   ```json
+   {
+     "request_id": "task-uuid-here"
+   }
+   ```
+
+5. **send_input** - Send additional input to an agent that requested it
+   ```json
+   {
+     "request_id": "task-uuid-here",
+     "input_text": "Here's the additional information you requested"
+   }
+   ```
+
+6. **export_logs** - Export execution logs of an agent task
+   ```json
+   {
+     "request_id": "task-uuid-here",
+     "format_type": "text"
+   }
+   ```
+
+7. **list_requests** - List all active agent requests
+   ```json
+   {}
+   ```
+
+### Pipeline Management Tools
+
+8. **execute_pipeline** - Execute a pipeline from a JSON definition
+   ```json
+   {
+     "pipeline_definition": {
+       "name": "Text Processing Pipeline",
+       "nodes": [
+         {
+           "id": "process",
+           "agent_name": "processor"
+         },
+         {
+           "id": "finalize",
+           "agent_name": "finalizer",
+           "inputs": {
+             "processed_data": {
+               "source_node": "process",
+               "source_artifact": "processed_data"
+             }
+           }
+         }
+       ],
+       "final_outputs": ["finalize"]
+     },
+     "input_text": "Process this text through the pipeline"
+   }
+   ```
+
+9. **get_pipeline_status** - Get status info for a running pipeline
+   ```json
+   {
+     "pipeline_id": "pipeline-uuid-here"
+   }
+   ```
+
+10. **cancel_pipeline** - Cancel an in-progress pipeline
+    ```json
+    {
+      "pipeline_id": "pipeline-uuid-here"
+    }
+    ```
+
+11. **send_pipeline_input** - Send input to a node in a pipeline
+    ```json
+    {
+      "pipeline_id": "pipeline-uuid-here",
+      "node_id": "process",
+      "input_text": "Additional input for the node"
+    }
+    ```
+
+12. **save_pipeline_template** - Save a pipeline definition as a reusable template
+    ```json
+    {
+      "template_id": "my-pipeline-template",
+      "pipeline_definition": {
+        "name": "My Reusable Pipeline",
+        "nodes": [
+          /* ... node definitions ... */
+        ],
+        "final_outputs": ["output-node-id"]
+      }
+    }
+    ```
+
+13. **list_pipeline_templates** - List all saved pipeline templates
+    ```json
+    {}
+    ```
+
+14. **execute_pipeline_from_template** - Execute a pipeline from a saved template
+    ```json
+    {
+      "template_id": "my-pipeline-template",
+      "input_text": "Process this text through the template pipeline"
+    }
+    ```
+
+15. **list_pipelines** - List all active and completed pipelines
+    ```json
+    {}
+    ```
+
+## Workflow
+
+### Single Agent Workflow
+
+```ascii
+┌─ Single Agent Workflow ───────────────────────────────────────────────────┐
+│                                                                           │
+│ ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────────────┐│
+│ │ 1. Registration │  │ 2. Discovery    │  │ 3. Agent Execution           ││
+│ │                 │  │                 │  │                              ││
+│ │ Register A2A    │  │ List available  │  │ Call agent with prompt       ││
+│ │ servers with    │  │ agents with     │  │ Observe real-time progress   ││
+│ │ a2a_server_     │  │ list_agents     │  │ Respond to input requests    ││
+│ │ registry        │  │                 │  │ Cancel tasks if needed       ││
+│ └─────────────────┘  └─────────────────┘  └──────────────────────────────┘│
+│                                                                           │
+│ ┌─────────────────────────────────────────────────────────────────────────┐
+│ │ 4. Post-Execution                                                      ││
+│ │                                                                        ││
+│ │ Export execution logs for review                                       ││
+│ │ List active/completed requests                                         ││
+│ └────────────────────────────────────────────────────────────────────────┘│
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline Orchestration Workflow
+
+```ascii
+┌─ Pipeline Orchestration Workflow ─────────────────────────────────────────┐
+│                                                                           │
+│ ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────────────┐│
+│ │ 1. Registration │  │ 2. Pipeline     │  │ 3. Pipeline Execution        ││
+│ │                 │  │    Definition   │  │                              ││
+│ │ Register A2A    │  │                 │  │ Execute pipeline with        ││
+│ │ servers with    │  │ Define pipeline │  │ initial input                ││
+│ │ a2a_server_     │  │ with nodes and  │  │ Monitor real-time progress   ││
+│ │ registry        │  │ dependencies    │  │ Respond to input requests    ││
+│ │                 │  │                 │  │ Cancel pipeline if needed    ││
+│ └─────────────────┘  └─────────────────┘  └──────────────────────────────┘│
+│                                                                           │
+│ ┌─────────────────┐  ┌─────────────────────────────────────────────────┐  │
+│ │ 4. Templates    │  │ 5. Post-Execution                               │  │
+│ │                 │  │                                                 │  │
+│ │ Save pipeline   │  │ Export execution logs for review                │  │
+│ │ as template     │  │ List active/completed pipelines                 │  │
+│ │ Execute from    │  │ Use final outputs for subsequent processing     │  │
+│ │ template        │  │                                                 │  │
+│ └─────────────────┘  └─────────────────────────────────────────────────┘  │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+## Demo Agents
+
+The repository includes two demo A2A agents in the `agents` directory to showcase the progress visibility and pipeline orchestration features:
+
+- **Agent 1 (Processor)**: First agent in the chain - processes input with progress updates
+- **Agent 2 (Finalizer)**: Second agent - finalizes processing of intermediate results
+
+These agents demonstrate:
+- Real-time progress reporting
+- Agent chain position information
+- Input requests
+- Task cancellation
+- Artifact production for pipeline orchestration
+
+These agents can be used in two ways:
+1. Direct invocation via the `call_agent` tool
+2. As nodes in a pipeline via the pipeline orchestration tools
+
+See the [agents/README.md](agents/README.md) file for setup and testing instructions.
+
+## User Interface Flow
+
+```ascii
+┌─ Claude Desktop Interface ───────────────────────────────────────────────┐
+│                                                                          │
+│  User: Can you process this document and give me a summary?              │
+│                                                                          │
+│  Claude: I'll help process your document using our specialized agents.   │
+│          I'll start by calling the processor agent:                      │
+│                                                                          │
+│          [Using call_agent with processor...]                            │
+│                                                                          │
+│          ⏳ Agent Progress: Working (10%) - Starting initial analysis     │
+│          ⏳ Agent Progress: Working (20%) - Extracting key sections       │
+│          ⏳ Agent Progress: Working (30%) - Analyzing content structure   │
+│          ❓ Agent Progress: Need additional information - Is this a       │
+│             technical or business document?                              │
+│                                                                          │
+│  User: It's a technical document about server architecture.              │
+│                                                                          │
+│  Claude: Thanks! I'll send that information to the agent:                │
+│                                                                          │
+│          [Using send_input...]                                           │
+│                                                                          │
+│          ⏳ Agent Progress: Working (40%) - Analyzing technical content   │
+│          ⏳ Agent Progress: Working (60%) - Identifying key concepts      │
+│          ⏳ Agent Progress: Working (80%) - Preparing intermediate results│
+│          ✅ Agent 1 Complete - Forwarding to finalizer agent (1/2)       │
+│                                                                          │
+│          ⏳ Agent Progress: Working (20%) - Finalizing summary (2/2)     │
+│          ⏳ Agent Progress: Working (40%) - Structuring key points (2/2) │
+│          ⏳ Agent Progress: Working (60%) - Polishing language (2/2)     │
+│          ⏳ Agent Progress: Working (80%) - Final formatting (2/2)       │
+│          ✅ Agent 2 Complete - Summary ready                             │
+│                                                                          │
+│          Here's your document summary:                                   │
+│          [Displays final summary with formatting]                        │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Technical Implementation
+
+- Uses FastMCP 2.0 with Context-based progress reporting
+- Leverages a2a_min client library for all A2A protocol communications
+- Supports both STDIO and HTTP transports for flexibility
+- Implements sophisticated throttling mechanism to prevent overwhelming clients
+- Tracks task states through the A2A protocol lifecycle
+- Provides detailed execution logging and export capabilities
+- Uses modern async/await patterns throughout the codebase
+
+## Local Testing
+
+This server has been tested locally with both the included demo agents and external A2A agents. It successfully enables Claude Desktop to communicate with A2A agents while providing detailed progress visibility.
+
+## Purpose
+
+This bridge allows Claude Desktop and other MCP clients to interact with any A2A-compatible agent with real-time progress visibility, extending their capabilities through the MCP tools interface. The server can be used with both STDIO and HTTP transports, making it compatible with a wide range of MCP clients.
