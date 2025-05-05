@@ -822,7 +822,7 @@ async def get_pipeline_status(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
         return {"status": "error", "message": f"Error: {str(e)}"}
 
 @mcp.tool()
-async def a2a_server_registry(action: Literal["add", "remove"], name: str, url: Optional[str] = None, ctx: Context) -> Dict[str, Any]:
+async def a2a_server_registry(action: Literal["add", "remove"], name: str, ctx: Context, url: Optional[str] = None) -> Dict[str, Any]:
     """
     Add or remove an A2A server URL.
     
