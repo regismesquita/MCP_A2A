@@ -271,6 +271,8 @@ Both agents expose:
 - Progress updates compatible with both STDIO and HTTP transport modes
 - Agent cards at /.well-known/agent.json
 
+All A2A protocol communications are handled through the a2a_min client library, which provides a clean, type-safe interface to the A2A protocol.
+
 ## Integration with FastMCP 2.0
 
 The MCP server uses FastMCP 2.0's Context-based architecture for progress reporting, which enables:

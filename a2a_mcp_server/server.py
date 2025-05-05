@@ -174,7 +174,8 @@ from fastmcp import FastMCP, Context
 
 # A2A imports
 from a2a_min import A2aMinClient
-from a2a_min.base.types import AgentCard, Message, TextPart
+from a2a_min.base.client.card_resolver import A2ACardResolver
+from a2a_min.base.types import AgentCard, Message, TextPart, TaskStatus, TaskSendParams
 
 # Create a class to store persistent state
 class ServerState:
@@ -497,80 +498,94 @@ class ServerState:
                     ctx=ctx
                 )
                 
-                # Send the request and process streaming responses
-                import httpx
-                
+                # Use A2aMinClient for pipeline agent communication
                 try:
-                    async with httpx.AsyncClient(timeout=600.0) as client:
-                        async with client.stream(
-                            "POST",
-                            base_url,
-                            json=json_rpc_request,
-                            headers={"Content-Type": "application/json"},
-                            timeout=600.0  # 10 minutes timeout
-                        ) as response:
-                            logger.debug(f"Streaming response started with status code: {response.status_code}")
+                    # Create A2A min client
+                    client = A2aMinClient.connect(url)
+                    
+                    # Create message for pipeline input
+                    message = Message(
+                        role="user",
+                        parts=[TextPart(text=prompt)]
+                    )
+                    
+                    logger.debug(f"Using A2aMinClient to send streaming message to {agent_name} for pipeline")
+                    
+                    # Update status to working
+                    await self.update_request_status(
+                        request_id=request_id,
+                        status="working",
+                        message=f"Connected to {agent_name}, waiting for response...",
+                        ctx=ctx
+                    )
+                    
+                    # Send message with streaming for pipeline
+                    try:
+                        # Send message with streaming
+                        streaming_task = await client.send_message_streaming(
+                            message=message,
+                            task_id=task_id,
+                            session_id=session_id
+                        )
+                        
+                        # Process streaming updates
+                        async for update in streaming_task.stream_updates():
+                            logger.debug(f"Received pipeline streaming update: {update}")
                             
-                            if response.status_code != 200:
-                                error_text = await response.text()
-                                logger.error(f"Error response: HTTP {response.status_code}: {error_text}")
-                                
-                                await self.update_request_status(
-                                    request_id=request_id,
-                                    status="failed",
-                                    message=f"HTTP error {response.status_code}: {error_text[:100]}...",
-                                    ctx=ctx
-                                )
-                                
-                                return {
-                                    "status": "error",
-                                    "message": f"Error from agent: HTTP {response.status_code}",
-                                    "request_id": request_id
+                            # Process the update using our existing mechanism
+                            # We need to convert the a2a_min update to our expected format
+                            converted_update = {
+                                "jsonrpc": "2.0", 
+                                "id": request_id,
+                                "result": {
+                                    "id": task_id,
+                                    "status": {
+                                        "state": update.status.state if update.status else "working",
+                                        "message": update.status.message if update.status else "",
+                                        "progress": update.status.progress if update.status else 0.0
+                                    },
+                                    "artifacts": [artifact.model_dump() if hasattr(artifact, 'model_dump') else vars(artifact) 
+                                                for artifact in (update.artifacts or [])]
                                 }
+                            }
                             
-                            # Process the streaming response
-                            buffer = ""
-                            async for chunk in response.aiter_text():
-                                buffer += chunk
-                                
-                                # Try to extract complete JSON objects from the buffer
-                                while "\n" in buffer:
-                                    line, buffer = buffer.split("\n", 1)
-                                    if not line.strip():
-                                        continue
-                                    
-                                    try:
-                                        update = json.loads(line)
-                                        await process_agent_update(request_id, agent_name, update, ctx)
-                                        
-                                        # Extract and store artifacts if present
-                                        if "result" in update and "artifacts" in update["result"]:
-                                            self.active_requests[request_id]["artifacts"] = update["result"]["artifacts"]
-                                    except json.JSONDecodeError as e:
-                                        logger.warning(f"Error decoding JSON from chunk: {line[:100]}... - {e}")
+                            # Process the converted update
+                            await process_agent_update(request_id, agent_name, converted_update, ctx)
                             
-                            # Process any remaining data in the buffer
-                            if buffer.strip():
-                                try:
-                                    update = json.loads(buffer)
-                                    await process_agent_update(request_id, agent_name, update, ctx)
-                                    
-                                    # Extract and store artifacts if present
-                                    if "result" in update and "artifacts" in update["result"]:
-                                        self.active_requests[request_id]["artifacts"] = update["result"]["artifacts"]
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"Error decoding JSON from final chunk: {buffer[:100]}... - {e}")
-                            
-                            # Mark as completed if we haven't already
-                            request_info = self.get_request_info(request_id)
-                            if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
-                                await self.update_request_status(
-                                    request_id=request_id,
-                                    status="completed",
-                                    progress=1.0,
-                                    message=f"Completed response from {agent_name}",
-                                    ctx=ctx
-                                )
+                            # Store artifacts
+                            if update.artifacts:
+                                self.active_requests[request_id]["artifacts"] = [
+                                    artifact.model_dump() if hasattr(artifact, 'model_dump') else vars(artifact) 
+                                    for artifact in update.artifacts
+                                ]
+                        
+                        # Mark as completed if we haven't already
+                        request_info = self.get_request_info(request_id)
+                        if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
+                            await self.update_request_status(
+                                request_id=request_id,
+                                status="completed",
+                                progress=1.0,
+                                message=f"Completed response from {agent_name}",
+                                ctx=ctx
+                            )
+                    
+                    except Exception as e:
+                        logger.exception(f"Error in pipeline streaming task: {e}")
+                        
+                        # Update status to failed
+                        await self.update_request_status(
+                            request_id=request_id,
+                            status="failed",
+                            message=f"Error: {str(e)}",
+                            ctx=ctx
+                        )
+                        
+                        return {
+                            "status": "error",
+                            "message": f"Error in pipeline streaming task: {str(e)}",
+                            "request_id": request_id
+                        }
                     
                     # Extract artifacts from the completed request
                     request_info = self.get_request_info(request_id)
@@ -670,34 +685,19 @@ state = ServerState()
 
 
 async def fetch_agent_card(url: str) -> Optional[AgentCard]:
-    """Fetch agent card from an A2A server."""
+    """Fetch agent card from an A2A server using A2ACardResolver."""
     try:
         logger.debug(f"Fetching agent card from {url}")
         
-        # Extract the base URL
-        if url.endswith('/'):
-            base_url = url
-        else:
-            base_url = url + '/'
-        
-        # Directly fetch the agent card from the well-known URL
-        import httpx
-        well_known_url = f"{base_url}.well-known/agent.json"
-        logger.debug(f"Requesting from {well_known_url}")
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(well_known_url)
-            logger.debug(f"Response status: {response.status_code}")
-            if response.status_code == 200:
-                card_data = response.json()
-                logger.debug(f"Received card data: {card_data}")
-                # Convert to AgentCard
-                card = AgentCard(**card_data)
-                return card
-            else:
-                logger.error(f"Failed to fetch agent card: HTTP {response.status_code}")
-                logger.debug(f"Response content: {response.text}")
-                return None
+        # Use the A2ACardResolver to get the agent card
+        card_resolver = A2ACardResolver(url)
+        try:
+            card = card_resolver.get_agent_card()
+            logger.debug(f"Received agent card: {card}")
+            return card
+        except Exception as e:
+            logger.error(f"Failed to fetch agent card: {str(e)}")
+            return None
                 
     except Exception as e:
         logger.exception(f"Error fetching agent card from {url}: {e}")
@@ -931,8 +931,7 @@ async def list_agents(ctx: Context) -> Dict[str, Any]:
                 "message": "No agents are registered. Use a2a_server_registry to add an agent."
             }
         
-        # Directly fetch agent cards
-        import httpx
+        # Fetch agent cards using A2ACardResolver
         agents = {}
         
         total_agents = len(state.registry)
@@ -951,25 +950,18 @@ async def list_agents(ctx: Context) -> Dict[str, Any]:
             try:
                 logger.debug(f"Fetching card for {name} from {url}")
                 
-                # Prepare URL
-                if url.endswith('/'):
-                    base_url = url
-                else:
-                    base_url = url + '/'
-                    
-                well_known_url = f"{base_url}.well-known/agent.json"
-                logger.debug(f"Requesting from {well_known_url}")
-                
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.get(well_known_url)
-                    logger.debug(f"Response status: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        card_data = response.json()
-                        logger.debug(f"Received card data: {card_data}")
-                        agents[name] = card_data
+                # Use A2ACardResolver to fetch the card
+                card_resolver = A2ACardResolver(url)
+                try:
+                    card = card_resolver.get_agent_card()
+                    if card:
+                        # Convert to dictionary for JSON response
+                        agents[name] = card.model_dump() if hasattr(card, 'model_dump') else vars(card)
+                        logger.debug(f"Received card for {name}: {card}")
                     else:
-                        logger.error(f"Failed to fetch agent card for {name}: HTTP {response.status_code}")
+                        logger.error(f"Failed to fetch agent card for {name}: No card returned")
+                except Exception as e:
+                    logger.error(f"Failed to fetch agent card for {name}: {str(e)}")
             except Exception as e:
                 logger.exception(f"Error fetching card for {name}: {e}")
         
@@ -1085,72 +1077,88 @@ async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, An
                 ctx=ctx
             )
             
-            # Send the request and process streaming responses
-            import httpx
-            
+            # Use A2aMinClient to send the message with streaming
             try:
-                async with httpx.AsyncClient(timeout=600.0) as client:
-                    async with client.stream(
-                        "POST",
-                        base_url,
-                        json=json_rpc_request,
-                        headers={"Content-Type": "application/json"},
-                        timeout=600.0  # 10 minutes timeout
-                    ) as response:
-                        logger.debug(f"Streaming response started with status code: {response.status_code}")
+                # Create A2A min client
+                client = A2aMinClient.connect(url)
+                
+                # Create text message
+                message = Message(
+                    role="user",
+                    parts=[TextPart(text=prompt)]
+                )
+                
+                # Send message with streaming
+                logger.debug(f"Using A2aMinClient to send streaming message to {agent_name}")
+                
+                # Update status to working
+                await state.update_request_status(
+                    request_id=mcp_request_id,
+                    status="working",
+                    message=f"Connected to {agent_name}, waiting for response...",
+                    ctx=ctx
+                )
+                
+                # Use the streaming API
+                try:
+                    # Send message with streaming
+                    streaming_task = await client.send_message_streaming(
+                        message=message,
+                        task_id=task_id,
+                        session_id=session_id
+                    )
+                    
+                    # Process streaming updates
+                    async for update in streaming_task.stream_updates():
+                        logger.debug(f"Received streaming update: {update}")
                         
-                        if response.status_code != 200:
-                            error_text = await response.text()
-                            logger.error(f"Error response: HTTP {response.status_code}: {error_text}")
-                            
-                            await state.update_request_status(
-                                request_id=mcp_request_id,
-                                status="failed",
-                                message=f"HTTP error {response.status_code}: {error_text[:100]}...",
-                                ctx=ctx
-                            )
-                            
-                            return {
-                                "status": "error",
-                                "message": f"Error from agent: HTTP {response.status_code}",
-                                "request_id": mcp_request_id
+                        # Process the update using our existing mechanism
+                        # We need to convert the a2a_min update to our expected format
+                        converted_update = {
+                            "jsonrpc": "2.0", 
+                            "id": mcp_request_id,
+                            "result": {
+                                "id": task_id,
+                                "status": {
+                                    "state": update.status.state if update.status else "working",
+                                    "message": update.status.message if update.status else "",
+                                    "progress": update.status.progress if update.status else 0.0
+                                },
+                                "artifacts": [artifact.model_dump() if hasattr(artifact, 'model_dump') else vars(artifact) 
+                                             for artifact in (update.artifacts or [])]
                             }
+                        }
                         
-                        # Process the streaming response
-                        buffer = ""
-                        async for chunk in response.aiter_text():
-                            buffer += chunk
-                            
-                            # Try to extract complete JSON objects from the buffer
-                            while "\n" in buffer:
-                                line, buffer = buffer.split("\n", 1)
-                                if not line.strip():
-                                    continue
-                                
-                                try:
-                                    update = json.loads(line)
-                                    await process_agent_update(mcp_request_id, agent_name, update, ctx)
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"Error decoding JSON from chunk: {line[:100]}... - {e}")
+                        # Process the converted update
+                        await process_agent_update(mcp_request_id, agent_name, converted_update, ctx)
+                    
+                    # Mark as completed if we haven't already
+                    request_info = state.get_request_info(mcp_request_id)
+                    if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
+                        await state.update_request_status(
+                            request_id=mcp_request_id,
+                            status="completed",
+                            progress=1.0,
+                            message=f"Completed response from {agent_name}",
+                            ctx=ctx
+                        )
                         
-                        # Process any remaining data in the buffer
-                        if buffer.strip():
-                            try:
-                                update = json.loads(buffer)
-                                await process_agent_update(mcp_request_id, agent_name, update, ctx)
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Error decoding JSON from final chunk: {buffer[:100]}... - {e}")
-                        
-                        # Mark as completed if we haven't already
-                        request_info = state.get_request_info(mcp_request_id)
-                        if request_info and request_info.get("status") not in ["completed", "failed", "canceled"]:
-                            await state.update_request_status(
-                                request_id=mcp_request_id,
-                                status="completed",
-                                progress=1.0,
-                                message=f"Completed response from {agent_name}",
-                                ctx=ctx
-                            )
+                except Exception as e:
+                    logger.exception(f"Error in streaming task: {e}")
+                    
+                    # Update status to failed
+                    await state.update_request_status(
+                        request_id=mcp_request_id,
+                        status="failed",
+                        message=f"Error: {str(e)}",
+                        ctx=ctx
+                    )
+                    
+                    return {
+                        "status": "error",
+                        "message": f"Error in streaming task: {str(e)}",
+                        "request_id": mcp_request_id
+                    }
                 
                 # Return the final status
                 return {
@@ -1373,58 +1381,74 @@ async def send_input(request_id: str, input_text: str, ctx: Context) -> Dict[str
         
         await ctx.report_progress(current=0.5, total=1.0, message=f"Sending input to {agent_name}")
         
-        # Send the input request
-        import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{base_url}",
-                json=json_rpc_request,
-                headers={"Content-Type": "application/json"}
+        # Use A2aMinClient to send input
+        try:
+            # Create A2A min client
+            client = A2aMinClient.connect(url)
+            
+            # Create message for input
+            message = Message(
+                role="user",
+                parts=[TextPart(text=input_text)]
             )
             
-            logger.debug(f"Input response status: {response.status_code}")
+            logger.debug(f"Using A2aMinClient to send input to {agent_name}")
             
-            if response.status_code == 200:
-                try:
-                    json_response = response.json()
-                    logger.debug(f"Received input response: {json.dumps(json_response)}")
-                    
-                    # Extract the task data
-                    task_data = json_response.get("result", {})
-                    status_data = task_data.get("status", {})
-                    task_state = status_data.get("state", "working")
-                    
-                    await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully sent input to {agent_name}")
-                    
-                    # Process the first update from the agent with the context
-                    await process_agent_update(request_id, agent_name, json_response, ctx)
-                    
-                    return {
-                        "status": "success",
-                        "message": f"Successfully sent input to {agent_name}",
-                        "task_state": task_state,
-                        "request_id": request_id
-                    }
-                except json.JSONDecodeError as e:
-                    logger.exception(f"Error decoding JSON response: {e}")
-                    error_msg = f"Error decoding response: {str(e)}"
-                    await ctx.error(error_msg)
-                    return {"status": "error", "message": error_msg}
-            else:
-                error_text = await response.text()
-                error_msg = f"Error sending input: HTTP {response.status_code}"
-                logger.error(f"Error sending input: HTTP {response.status_code}: {error_text}")
-                
-                # Update status back to input-required since the input failed
-                await state.update_request_status(
-                    request_id=request_id,
-                    status="input-required",
-                    message=f"Error sending input to {agent_name}: HTTP {response.status_code}",
-                    ctx=ctx
-                )
-                
-                await ctx.error(error_msg)
-                return {"status": "error", "message": error_msg}
+            # Send input
+            task = await client.send_input(
+                task_id=task_id,
+                session_id=session_id,
+                message=message
+            )
+            
+            logger.debug(f"Received input response: {task}")
+            
+            # Get status from the task
+            status = task.status if hasattr(task, 'status') else None
+            task_state = status.state if status else "working"
+            
+            await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully sent input to {agent_name}")
+            
+            # Convert task to expected format for process_agent_update
+            converted_update = {
+                "jsonrpc": "2.0", 
+                "id": request_id,
+                "result": {
+                    "id": task_id,
+                    "status": {
+                        "state": status.state if status else "working",
+                        "message": status.message if status else "",
+                        "progress": status.progress if status else 0.0
+                    },
+                    "artifacts": [artifact.model_dump() if hasattr(artifact, 'model_dump') else vars(artifact) 
+                                 for artifact in (task.artifacts if hasattr(task, 'artifacts') else [])]
+                }
+            }
+            
+            # Process the update
+            await process_agent_update(request_id, agent_name, converted_update, ctx)
+            
+            return {
+                "status": "success",
+                "message": f"Successfully sent input to {agent_name}",
+                "task_state": task_state,
+                "request_id": request_id
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error sending input: {e}")
+            error_msg = f"Error sending input: {str(e)}"
+            
+            # Update status back to input-required since the input failed
+            await state.update_request_status(
+                request_id=request_id,
+                status="input-required",
+                message=f"Error sending input to {agent_name}: {str(e)}",
+                ctx=ctx
+            )
+            
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
     
     except Exception as e:
         logger.exception(f"Error in send_input: {str(e)}")
@@ -1495,39 +1519,42 @@ async def cancel_request(request_id: str, ctx: Context) -> Dict[str, Any]:
         
         await ctx.report_progress(current=0.5, total=1.0, message=f"Sending cancellation request to {agent_name}")
         
-        # Send the cancel request
-        import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{base_url}",
-                json=json_rpc_request,
-                headers={"Content-Type": "application/json"}
+        # Use A2aMinClient to cancel task
+        try:
+            # Create A2A min client
+            client = A2aMinClient.connect(url)
+            
+            logger.debug(f"Using A2aMinClient to cancel task for {agent_name}")
+            
+            # Cancel the task
+            result = await client.cancel_task(
+                task_id=task_id,
+                session_id=session_id
             )
             
-            logger.debug(f"Cancel response status: {response.status_code}")
+            logger.debug(f"Received cancel response: {result}")
             
-            if response.status_code == 200:
-                # Update our local state
-                await state.update_request_status(
-                    request_id=request_id,
-                    status="canceled",
-                    message=f"Request to {agent_name} was canceled by the user",
-                    ctx=ctx
-                )
-                
-                # Mark as completed in Context
-                await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully canceled request {request_id}")
-                
-                return {
-                    "status": "success",
-                    "message": f"Successfully canceled request {request_id}"
-                }
-            else:
-                error_text = await response.text()
-                error_msg = f"Error canceling request: HTTP {response.status_code}"
-                logger.error(f"Error canceling request: HTTP {response.status_code}: {error_text}")
-                await ctx.error(error_msg)
-                return {"status": "error", "message": error_msg}
+            # Update our local state
+            await state.update_request_status(
+                request_id=request_id,
+                status="canceled",
+                message=f"Request to {agent_name} was canceled by the user",
+                ctx=ctx
+            )
+            
+            # Mark as completed in Context
+            await ctx.report_progress(current=1.0, total=1.0, message=f"Successfully canceled request {request_id}")
+            
+            return {
+                "status": "success",
+                "message": f"Successfully canceled request {request_id}"
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error canceling task: {e}")
+            error_msg = f"Error canceling request: {str(e)}"
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
     
     except Exception as e:
         logger.exception(f"Error in cancel_request: {str(e)}")

@@ -465,6 +465,7 @@ See the [agents/README.md](agents/README.md) file for setup and testing instruct
 ## Technical Implementation
 
 - Uses FastMCP 2.0 with Context-based progress reporting
+- Leverages a2a_min client library for all A2A protocol communications
 - Supports both STDIO and HTTP transports for flexibility
 - Implements sophisticated throttling mechanism to prevent overwhelming clients
 - Tracks task states through the A2A protocol lifecycle
