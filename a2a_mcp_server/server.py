@@ -1563,7 +1563,7 @@ async def cancel_request(request_id: str, ctx: Context) -> Dict[str, Any]:
 
 # Define tool for exporting execution logs
 @mcp.tool()
-async def export_logs(request_id: str, format_type: Literal["text", "json"] = "text", file_path: Optional[str] = None, ctx: Context) -> Dict[str, Any]:
+async def export_logs(request_id: str, ctx: Context, format_type: Literal["text", "json"] = "text", file_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Export execution logs for a request, optionally saving to a file.
     
