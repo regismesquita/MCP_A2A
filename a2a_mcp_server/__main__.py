@@ -9,8 +9,9 @@ Usage:
   python -m a2a_mcp_server server  # Start the MCP server
 """
 
-import sys
 import argparse
+import sys
+
 from a2a_mcp_server.server import main_cli as server_main
 
 
@@ -25,12 +26,11 @@ def main():
 
     # Otherwise, handle as normal CLI
     parser = argparse.ArgumentParser(description="A2A MCP Server")
-    parser.add_argument("command", choices=["server"], 
-                       help="Which component to run")
-    
+    parser.add_argument("command", choices=["server"], help="Which component to run")
+
     try:
         args = parser.parse_args()
-        
+
         if args.command == "server":
             server_main()
         else:
