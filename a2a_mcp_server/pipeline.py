@@ -811,7 +811,8 @@ class PipelineExecutionEngine:
                 PipelineStatus.CANCELED,
             ]:
                 logger.info(
-                    f"Pipeline {pipeline_id} {pipeline_state.status}, stopping execution"
+                    f"Pipeline {pipeline_id} {pipeline_state.status}, "
+                    f"stopping execution"
                 )
                 await self._report_pipeline_progress(pipeline_id, ctx)
                 return
@@ -871,14 +872,16 @@ class PipelineExecutionEngine:
                     PipelineStatus.CANCELED,
                 ]:
                     logger.info(
-                        f"Pipeline {pipeline_id} {pipeline_state.status}, stopping execution"
+                        f"Pipeline {pipeline_id} {pipeline_state.status}, "
+                    f"stopping execution"
                     )
                     return
 
             except Exception as e:
                 # Handle node execution error
                 logger.exception(
-                    f"Error executing node {node_id} in pipeline {pipeline_id}: {str(e)}"
+                    f"Error executing node {node_id} in pipeline {pipeline_id}: "
+                    f"{str(e)}"
                 )
 
                 # Update node status
@@ -896,18 +899,21 @@ class PipelineExecutionEngine:
                 error_policy = pipeline_state.definition.get_error_policy(node_id)
                 if error_policy == ErrorPolicy.FAIL_FAST:
                     logger.info(
-                        f"Pipeline {pipeline_id} failed with fail_fast policy, stopping execution"
+                        f"Pipeline {pipeline_id} failed with fail_fast policy, "
+                        f"stopping execution"
                     )
                     return
                 elif error_policy == ErrorPolicy.CONTINUE:
                     logger.info(
-                        f"Pipeline {pipeline_id} continuing despite node {node_id} failure"
+                        f"Pipeline {pipeline_id} continuing despite node "
+                        f"{node_id} failure"
                     )
                     continue
                 else:
-                    # For now, treat retry the same as fail_fast (will implement retry later)
+                    # For now, treat retry the same as fail_fast (implement retry later)
                     logger.info(
-                        f"Pipeline {pipeline_id} failed with retry policy, stopping execution (retry not implemented)"
+                        f"Pipeline {pipeline_id} failed with retry policy, "
+                        f"stopping execution (retry not implemented)"
                     )
                     return
 
@@ -927,7 +933,8 @@ class PipelineExecutionEngine:
         # Complete the context with the final outputs
         final_outputs_str = json.dumps(final_outputs, indent=2)
         await ctx.complete(
-            f"Pipeline {pipeline_id} completed successfully with outputs: {final_outputs_str}"
+            f"Pipeline {pipeline_id} completed successfully with outputs: "
+            f"{final_outputs_str}"
         )
 
     def _map_inputs(
@@ -951,7 +958,8 @@ class PipelineExecutionEngine:
         if not input_mappings and node_id == pipeline_state.execution_order[0]:
             return inputs.get("initial_input", {})
 
-        # If no mappings defined for non-first nodes, collect artifacts from all upstream nodes
+        # If no mappings defined for non-first nodes, collect artifacts from all
+        # upstream nodes
         if not input_mappings:
             # Find all upstream nodes
             upstream_nodes = set()
@@ -977,7 +985,8 @@ class PipelineExecutionEngine:
             # Skip if source node data not available
             if source_node not in inputs:
                 logger.warning(
-                    f"Source node {source_node} not in available inputs for node {node_id}"
+                    f"Source node {source_node} not in available inputs for node "
+                    f"{node_id}"
                 )
                 continue
 
@@ -1023,12 +1032,14 @@ class PipelineExecutionEngine:
             return None
 
         # Prepare input for the agent
-        # For initial implementation, assume text input and flatten all inputs into a text prompt
+        # For initial implementation, assume text input and flatten all inputs
+        # into a text prompt
         prompt = self._prepare_prompt_from_inputs(inputs)
 
         # Execute the agent
         logger.info(
-            f"Calling agent {agent_name} for node {node_id} in pipeline {pipeline_state.pipeline_id}"
+            f"Calling agent {agent_name} for node {node_id} in pipeline "
+            f"{pipeline_state.pipeline_id}"
         )
 
         # Generate unique IDs for the request
@@ -1077,7 +1088,8 @@ class PipelineExecutionEngine:
 
         except Exception as e:
             logger.exception(
-                f"Error executing node {node_id} in pipeline {pipeline_state.pipeline_id}: {str(e)}"
+                f"Error executing node {node_id} in pipeline "
+                f"{pipeline_state.pipeline_id}: {str(e)}"
             )
             node_state.status = NodeStatus.FAILED
             node_state.message = f"Error executing node: {str(e)}"

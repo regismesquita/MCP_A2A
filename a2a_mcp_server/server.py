@@ -28,10 +28,8 @@ from typing import (
     Optional,
     Tuple,
     TypeVar,
-    Union,
 )
 
-import httpx
 import jsonschema
 
 # Set up logging to stderr with more detailed format
@@ -102,7 +100,8 @@ class UpdateThrottler(Generic[T]):
             key: Unique identifier for the update stream
             update: The update data to add
             is_critical: Whether this update is critical and should bypass throttling
-            merge_similar: Optional function to determine if updates are similar and can be merged
+            merge_similar: Optional function to determine if updates are similar and can be
+                merged
 
         Returns:
             Tuple[bool, Optional[List[T]]]:
@@ -189,13 +188,11 @@ class UpdateThrottler(Generic[T]):
             queue.clear()
 
 
-# MCP imports
-from fastmcp import FastMCP, Context
-
-# A2A imports
+# Third-party imports
 from a2a_min import A2aMinClient
 from a2a_min.base.client.card_resolver import A2ACardResolver
-from a2a_min.base.types import AgentCard, Message, TextPart, TaskStatus, TaskSendParams
+from a2a_min.base.types import AgentCard, Message, TextPart
+from fastmcp import Context, FastMCP
 
 
 # Create a class to store persistent state
@@ -486,11 +483,7 @@ class ServerState:
             logger.debug(f"Using URL: {url}")
 
             try:
-                # Prepare the URL
-                if url.endswith("/"):
-                    base_url = url
-                else:
-                    base_url = url + "/"
+                # A2aMinClient handles URL normalization internally (base_url not needed)
 
                 # Track request with pipeline info
                 self.track_request(
@@ -898,7 +891,7 @@ async def get_pipeline_status(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
 
         return {
             "status": "success",
-            "message": f"Pipeline status retrieved",
+            "message": "Pipeline status retrieved",
             "pipeline": pipeline_info,
         }
     except Exception as e:
@@ -946,7 +939,7 @@ async def a2a_server_registry(
             logger.debug(f"Registry after: {state.registry}")
 
             await ctx.report_progress(
-                current=0.5, total=1.0, message=f"Updating agent cache"
+                current=0.5, total=1.0, message="Updating agent cache"
             )
 
             # Update the cache asynchronously
@@ -1132,11 +1125,7 @@ async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, An
             import json
             import uuid
 
-            # Prepare the URL
-            if url.endswith("/"):
-                base_url = url
-            else:
-                base_url = url + "/"
+            # A2aMinClient handles URL normalization internally
 
             # Generate unique IDs
             mcp_request_id = str(uuid.uuid4())
@@ -1394,7 +1383,10 @@ async def process_agent_update(
         artifacts = task_data.get("artifacts", [])
         if artifacts:
             artifact_names = [a.get("name", "unnamed") for a in artifacts]
-            status_message = f"{agent_name} completed with {len(artifacts)} artifact(s): {', '.join(artifact_names)}"
+            status_message = (
+                f"{agent_name} completed with {len(artifacts)} artifact(s): "
+                f"{', '.join(artifact_names)}"
+            )
 
     # Get chain position info (current agent in chain)
     chain_position = {"current": 1, "total": 1}
@@ -1410,7 +1402,8 @@ async def process_agent_update(
     )
 
     logger.debug(
-        f"Updated request status for {mcp_request_id}: {mapped_state}, should_send={should_send}"
+        f"Updated request status for {mcp_request_id}: {mapped_state}, "
+        f"should_send={should_send}"
     )
 
 
@@ -1451,9 +1444,13 @@ async def send_input(request_id: str, input_text: str, ctx: Context) -> Dict[str
         # Verify the request is in the input-required state
         current_status = request_info.get("status", "unknown")
         if current_status != "input-required":
-            error_msg = f"Request {request_id} is not waiting for input (status: {current_status})"
+            error_msg = (
+                f"Request {request_id} is not waiting for input "
+                f"(status: {current_status})"
+            )
             logger.warning(
-                f"Request {request_id} is not in input-required state (status: {current_status})"
+                f"Request {request_id} is not in input-required state "
+                f"(status: {current_status})"
             )
             await ctx.error(error_msg)
             return {"status": "error", "message": error_msg}
@@ -2001,22 +1998,11 @@ async def cancel_pipeline(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
                 # Try to cancel the agent task
                 agent_name = current_node.agent_name
                 if agent_name in state.registry:
-                    url = state.registry[agent_name]
+                    agent_url = state.registry[agent_name]
 
                     try:
-                        # Prepare client to cancel request
-                        # A2aMinClient handles URL normalization internally
-
-                        # Prepare the JSON-RPC cancel request
-                        json_rpc_request = {
-                            "jsonrpc": "2.0",
-                            "id": str(uuid.uuid4()),
-                            "method": "tasks/cancel",
-                            "params": {
-                                "id": current_node.task_id,
-                                "sessionId": current_node.session_id,
-                            },
-                        }
+                        # Create a2a_min client for the agent
+                        client = A2aMinClient.connect(agent_url)
 
                         # Send the cancel request
                         await ctx.report_progress(
@@ -2025,16 +2011,13 @@ async def cancel_pipeline(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
                             message=f"Canceling agent task for {agent_name}",
                         )
 
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            response = await client.post(
-                                f"{base_url}",
-                                json=json_rpc_request,
-                                headers={"Content-Type": "application/json"},
-                            )
+                        # Cancel the task using a2a_min client
+                        await client.cancel_task(
+                            task_id=current_node.task_id,
+                            session_id=current_node.session_id
+                        )
 
-                            logger.debug(
-                                f"Cancel response status: {response.status_code}"
-                            )
+                        logger.debug("Cancel response received")
                     except Exception as e:
                         logger.exception(f"Error canceling agent task: {e}")
 
@@ -2071,7 +2054,8 @@ async def send_pipeline_input(
     """
     try:
         logger.debug(
-            f"send_pipeline_input called for pipeline_id={pipeline_id}, node_id={node_id}"
+            f"send_pipeline_input called for pipeline_id={pipeline_id}, "
+            f"node_id={node_id}"
         )
 
         await ctx.report_progress(
@@ -2133,27 +2117,9 @@ async def send_pipeline_input(
         )
 
         try:
-            # Prepare the URL
-            if url.endswith("/"):
-                base_url = url
-            else:
-                base_url = url + "/"
+            # A2aMinClient handles URL normalization internally (base_url not needed)
 
-            # Prepare the JSON-RPC request
-            request_id = str(uuid.uuid4())
-            json_rpc_request = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tasks/sendInput",
-                "params": {
-                    "id": node_state.task_id,
-                    "sessionId": node_state.session_id,
-                    "message": {
-                        "role": "user",
-                        "parts": [{"type": "text", "text": input_text}],
-                    },
-                },
-            }
+            # No need to generate a unique request ID for tracking when using a2a_min client
 
             # Update node status to working
             node_state.status = NodeStatus.WORKING
@@ -2169,78 +2135,47 @@ async def send_pipeline_input(
                 message=pipeline_state.message,
             )
 
-            # Send the request
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{base_url}",
-                    json=json_rpc_request,
-                    headers={"Content-Type": "application/json"},
-                )
+            # Create a2a_min client for the agent
+            client = A2aMinClient.connect(url)
 
-                logger.debug(f"Input response status: {response.status_code}")
+            # Create a message from the input text
+            message = Message(role="user", parts=[TextPart(text=input_text)])
 
-                if response.status_code == 200:
-                    try:
-                        json_response = response.json()
-                        logger.debug(
-                            f"Received input response: {json.dumps(json_response)}"
-                        )
+            # Send the input using a2a_min client
+            task = await client.send_input(
+                task_id=node_state.task_id,
+                session_id=node_state.session_id,
+                message=message
+            )
 
-                        # Update the node status based on the response
-                        task_data = json_response.get("result", {})
-                        status_data = task_data.get("status", {})
-                        task_state = status_data.get("state", "working")
+            logger.debug("Input response received")
 
-                        # Update node status
-                        node_state.message = status_data.get(
-                            "message", f"Processing input: {input_text[:50]}..."
-                        )
+            # Extract the task status data
+            task_state = task.status.value if hasattr(task, 'status') else "working"
 
-                        # Update pipeline status
-                        pipeline_state.update_status()
-                        pipeline_state.update_progress()
+            # Update node status
+            node_state.message = f"Processing input: {input_text[:50]}..."
 
-                        await ctx.report_progress(
-                            current=pipeline_state.progress,
-                            total=1.0,
-                            message=pipeline_state.message,
-                        )
+            # Update pipeline status
+            pipeline_state.update_status()
+            pipeline_state.update_progress()
 
-                        return {
-                            "status": "success",
-                            "message": f"Input sent to node {node_id} in pipeline {pipeline_id}",
-                            "node_status": task_state,
-                        }
-                    except Exception as e:
-                        error_msg = f"Error processing response: {str(e)}"
-                        logger.exception(error_msg)
-                        await ctx.error(error_msg)
-                        return {"status": "error", "message": error_msg}
-                else:
-                    error_text = await response.text()
-                    error_msg = f"Error sending input: HTTP {response.status_code}: {error_text}"
-                    logger.error(error_msg)
+            await ctx.report_progress(
+                current=pipeline_state.progress,
+                total=1.0,
+                message=pipeline_state.message,
+            )
 
-                    # Revert node status to input-required
-                    node_state.status = NodeStatus.INPUT_REQUIRED
-                    node_state.message = (
-                        f"Error sending input: HTTP {response.status_code}"
-                    )
-
-                    # Update pipeline status
-                    pipeline_state.update_status()
-                    pipeline_state.update_progress()
-
-                    await ctx.report_progress(
-                        current=pipeline_state.progress,
-                        total=1.0,
-                        message=pipeline_state.message,
-                    )
-
-                    await ctx.error(error_msg)
-                    return {"status": "error", "message": error_msg}
+            return {
+                "status": "success",
+                "message": (
+                    f"Input sent to node {node_id} in pipeline "
+                    f"{pipeline_id}"
+                ),
+                "node_status": task_state,
+            }
         except Exception as e:
-            error_msg = f"Error sending input to node {node_id}: {str(e)}"
+            error_msg = f"Error sending input: {str(e)}"
             logger.exception(error_msg)
 
             # Revert node status to input-required

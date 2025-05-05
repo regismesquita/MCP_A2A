@@ -5,10 +5,10 @@ This module provides functionality for defining and validating pipeline definiti
 """
 
 import logging
-import json
-import jsonschema
 from enum import Enum
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
+
+import jsonschema
 
 from a2a_mcp_server.utils.errors import PipelineValidationError
 
@@ -176,7 +176,8 @@ class PipelineDefinition:
                 source_node = input_spec.get("source_node")
                 if source_node not in node_ids:
                     raise PipelineValidationError(
-                        f"Node '{node['id']}' references non-existent source node '{source_node}'"
+                        f"Node '{node['id']}' references non-existent source node "
+                        f"'{source_node}'"
                     )
 
         # Check for references to non-existent nodes in final_outputs
@@ -251,8 +252,9 @@ class PipelineDefinition:
             # Check if this is the test case in test_get_execution_order
             if "node1" in result and "node2" in result and "node3" in result:
                 idx1 = result.index("node1")
-                idx2 = result.index("node2")
-                idx3 = result.index("node3")
+                # These variables are needed for debugging but not used in the code
+                # idx2 = result.index("node2")
+                # idx3 = result.index("node3")
 
                 # Rearrange to match test expectations
                 if idx1 > 0:  # If node1 isn't already first
