@@ -16,6 +16,16 @@ dependencies = [
     "a2a_min",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.10.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-cov>=4.1.0",
+    "respx>=0.20.0",
+]
+
 [project.scripts]
 a2a-mcp-server = "a2a_mcp_server.server:main_cli"
 
@@ -27,3 +37,9 @@ line-length = 88
 target-version = "py312"
 select = ["E", "F", "I", "W"]
 ignore = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
+timeout = 10
