@@ -162,10 +162,10 @@ The server can orchestrate interactions between multiple agents in a chain while
 │  │  ● ServerState                      │  │  ● FastMCP 2.0 Context      ││
 │  │    - registry (name → url)          │  │    for progress reporting   ││
 │  │    - cache (name → AgentCard)       │  │  ● STDIO and HTTP transports││
-│  │    - active_requests                │  │  ● JSON-RPC for A2A         ││
-│  │    - execution_logs                 │  │    protocol communication   ││
-│  │    - update_throttler               │  │  ● Throttling mechanism     ││
-│  │    - pipelines                      │  │                             ││
+│  │    - active_requests                │  │  ● a2a_min client library   ││
+│  │    - execution_logs                 │  │    for A2A protocol         ││
+│  │    - update_throttler               │  │    communication            ││
+│  │    - pipelines                      │  │  ● Throttling mechanism     ││
 │  │    - pipeline_templates             │  │                             ││
 │  │                                     │  │                             ││
 │  └─────────────────────────────────────┘  └─────────────────────────────┘│

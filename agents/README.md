@@ -161,7 +161,7 @@ For direct testing of the agents without going through the MCP server:
 python client.py "Your input text here"
 ```
 
-This will call Agent 1 directly and show you progress updates. Note that the direct agent-to-agent forwarding has been removed in favor of the more flexible pipeline orchestration system.
+This will use the a2a_min client library to call Agent 1 directly and show you progress updates. The client uses SSE streaming to display real-time progress information. Note that the direct agent-to-agent forwarding has been removed in favor of the more flexible pipeline orchestration system.
 
 ### Testing with MCP Server in STDIO Mode
 
