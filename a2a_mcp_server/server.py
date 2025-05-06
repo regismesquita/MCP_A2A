@@ -197,24 +197,57 @@ from fastmcp import Context, FastMCP
 
 # Create a class to store persistent state
 class ServerState:
-    def __init__(self):
+    def __init__(
+        self,
+        max_execution_logs: int = 1000,
+        max_pipelines: int = 500,
+        pipeline_ttl_hours: float = 24.0,
+        execution_log_ttl_hours: float = 12.0,
+        client_cache_ttl_minutes: float = 10.0,
+        agent_card_ttl_hours: float = 48.0,
+        max_agent_cards: int = 200,
+        max_client_cache: int = 50,
+    ):
+        # Registry and agent cache
         self.registry = {}  # name -> url
         self.cache = {}  # name -> AgentCard
+        self.agent_card_timestamps = {}  # name -> timestamp
+        self.max_agent_cards = max_agent_cards
+        self.agent_card_ttl_hours = agent_card_ttl_hours
+        
+        # Active request tracking
         self.active_requests = {}  # request_id -> status info
-        self.execution_logs = {}  # request_id -> execution log
         self.last_update_time = {}  # request_id -> timestamp
-
-        # Add pipeline storage
+        
+        # Storage with size limits and TTL
+        self.execution_logs = {}  # request_id -> execution log
+        self.max_execution_logs = max_execution_logs
+        self.execution_log_ttl_hours = execution_log_ttl_hours
+        self.execution_log_timestamps = {}  # request_id -> completion timestamp
+        
+        # Pipeline storage with size limits and TTL
         self.pipeline_templates = {}  # template_id -> pipeline definition
         self.pipelines = {}  # pipeline_id -> pipeline state
+        self.max_pipelines = max_pipelines
+        self.pipeline_ttl_hours = pipeline_ttl_hours
+        self.pipeline_timestamps = {}  # pipeline_id -> completion timestamp
 
         # Create a throttler for updates with 1-second interval, batch size of 5
         self.update_throttler = UpdateThrottler[Dict[str, Any]](
             min_interval=1.0, batch_size=5, max_queue_size=100
         )
+        
+        # A2A Min Client cache with size limits and TTL
+        self.client_cache = {}  # url -> (client, timestamp)
+        self.client_cache_ttl_minutes = client_cache_ttl_minutes
+        self.max_client_cache = max_client_cache
+        self.client_cache_lock = asyncio.Lock()  # Lock for safe client cache access
 
         # Create pipeline execution engine (initialized later to avoid circular imports)
         self.pipeline_engine = None
+        
+        # Start background cleanup task
+        asyncio.create_task(self._periodic_cleanup())
 
     def track_request(
         self,
@@ -420,9 +453,23 @@ class ServerState:
             ctx=ctx,
         )
 
+        # Record completion timestamp for TTL tracking
+        self.execution_log_timestamps[request_id] = time.time()
+        
+        # For pipeline-related requests, update pipeline timestamp too
+        if request.get("pipeline_id"):
+            self.pipeline_timestamps[request.get("pipeline_id")] = time.time()
+
         # Get the final state
         final_state = self.active_requests.pop(request_id, {})
         self.last_update_time.pop(request_id, None)
+        
+        # Clear any pending updates in the update throttler
+        self.update_throttler.clear(request_id)
+        
+        # Enforce size limits if needed
+        if len(self.execution_logs) > self.max_execution_logs:
+            self._evict_old_execution_logs()
 
         return final_state
 
@@ -437,6 +484,306 @@ class ServerState:
             List of log entries
         """
         return self.execution_logs.get(request_id, [])
+        
+    def _evict_old_execution_logs(self) -> None:
+        """
+        Evict old execution logs based on completion time and max size limit.
+        Implements a simple LRU (Least Recently Used) eviction strategy.
+        """
+        if not self.execution_logs:
+            return
+            
+        # If we're under the limit, no need to evict
+        if len(self.execution_logs) <= self.max_execution_logs:
+            return
+            
+        # Calculate how many to remove
+        num_to_remove = len(self.execution_logs) - self.max_execution_logs + 10  # Remove extra to avoid frequent evictions
+        
+        # Sort by timestamp (oldest first)
+        sorted_logs = sorted(
+            self.execution_log_timestamps.items(),
+            key=lambda x: x[1]
+        )
+        
+        # Remove oldest logs
+        for request_id, _ in sorted_logs[:num_to_remove]:
+            if request_id in self.execution_logs:
+                self.execution_logs.pop(request_id)
+                self.execution_log_timestamps.pop(request_id, None)
+                logger.debug(f"Evicted old execution log for request {request_id}")
+                
+    def _evict_old_pipelines(self) -> None:
+        """
+        Evict old pipeline states based on completion time and max size limit.
+        Implements a simple LRU (Least Recently Used) eviction strategy.
+        """
+        if not self.pipelines:
+            return
+            
+        # If we're under the limit, no need to evict
+        if len(self.pipelines) <= self.max_pipelines:
+            return
+            
+        # Calculate how many to remove
+        num_to_remove = len(self.pipelines) - self.max_pipelines + 5  # Remove extra to avoid frequent evictions
+        
+        # Sort by timestamp (oldest first)
+        sorted_pipelines = sorted(
+            self.pipeline_timestamps.items(),
+            key=lambda x: x[1]
+        )
+        
+        # Remove oldest pipeline states
+        for pipeline_id, _ in sorted_pipelines[:num_to_remove]:
+            if pipeline_id in self.pipelines:
+                self.pipelines.pop(pipeline_id)
+                self.pipeline_timestamps.pop(pipeline_id, None)
+                logger.debug(f"Evicted old pipeline state for pipeline {pipeline_id}")
+                
+    def _evict_old_agent_cards(self) -> None:
+        """
+        Evict old agent cards based on last access time and max size limit.
+        Implements a simple LRU (Least Recently Used) eviction strategy.
+        """
+        if not self.cache:
+            return
+            
+        # If we're under the limit, no need to evict
+        if len(self.cache) <= self.max_agent_cards:
+            return
+            
+        # Calculate how many to remove
+        num_to_remove = len(self.cache) - self.max_agent_cards + 2  # Remove extra to avoid frequent evictions
+        
+        # Sort by timestamp (oldest first)
+        sorted_cards = sorted(
+            self.agent_card_timestamps.items(),
+            key=lambda x: x[1]
+        )
+        
+        # Remove oldest agent cards
+        for agent_name, _ in sorted_cards[:num_to_remove]:
+            if agent_name in self.cache:
+                self.cache.pop(agent_name)
+                self.agent_card_timestamps.pop(agent_name, None)
+                logger.debug(f"Evicted old agent card for agent {agent_name}")
+                
+    async def _evict_old_client_cache(self) -> None:
+        """
+        Evict old A2A min clients based on last access time and max size limit.
+        Implements a simple LRU (Least Recently Used) eviction strategy.
+        Uses a lock for thread safety.
+        """
+        async with self.client_cache_lock:
+            if not self.client_cache:
+                return
+                
+            # If we're under the limit, no need to evict
+            if len(self.client_cache) <= self.max_client_cache:
+                return
+                
+            # Calculate how many to remove
+            num_to_remove = len(self.client_cache) - self.max_client_cache + 2  # Remove extra to avoid frequent evictions
+            
+            # Sort by timestamp (oldest first)
+            sorted_clients = sorted(
+                [(url, timestamp) for url, (_, timestamp) in self.client_cache.items()],
+                key=lambda x: x[1]
+            )
+            
+            # Remove oldest clients
+            for url, _ in sorted_clients[:num_to_remove]:
+                if url in self.client_cache:
+                    self.client_cache.pop(url)
+                    logger.debug(f"Evicted old A2aMinClient for URL {url} due to cache size limit")
+                
+    async def _periodic_cleanup(self) -> None:
+        """
+        Periodically clean up old execution logs and pipeline states based on TTL.
+        Runs every hour in the background.
+        """
+        while True:
+            try:
+                # Wait for an hour between cleanup cycles
+                await asyncio.sleep(3600)  # 1 hour
+                
+                await self._cleanup_by_ttl()
+                
+            except Exception as e:
+                logger.exception(f"Error in periodic cleanup: {str(e)}")
+    
+    async def _cleanup_by_ttl(self) -> None:
+        """
+        Clean up old execution logs, pipeline states, active requests, and client cache based on TTL.
+        """
+        current_time = time.time()
+        
+        # Clean up execution logs
+        execution_log_ttl_seconds = self.execution_log_ttl_hours * 3600
+        logs_to_remove = []
+        
+        for request_id, timestamp in list(self.execution_log_timestamps.items()):
+            if (current_time - timestamp) > execution_log_ttl_seconds:
+                logs_to_remove.append(request_id)
+                
+        for request_id in logs_to_remove:
+            self.execution_logs.pop(request_id, None)
+            self.execution_log_timestamps.pop(request_id, None)
+            logger.debug(f"Cleaned up execution log for request {request_id} due to TTL expiration")
+            
+        # Clean up pipeline states
+        pipeline_ttl_seconds = self.pipeline_ttl_hours * 3600
+        pipelines_to_remove = []
+        
+        for pipeline_id, timestamp in list(self.pipeline_timestamps.items()):
+            if (current_time - timestamp) > pipeline_ttl_seconds:
+                pipelines_to_remove.append(pipeline_id)
+                
+        for pipeline_id in pipelines_to_remove:
+            self.pipelines.pop(pipeline_id, None)
+            self.pipeline_timestamps.pop(pipeline_id, None)
+            logger.debug(f"Cleaned up pipeline state for pipeline {pipeline_id} due to TTL expiration")
+        
+        # Clean up client cache
+        client_cache_ttl_seconds = self.client_cache_ttl_minutes * 60
+        clients_to_remove = []
+        
+        async with self.client_cache_lock:
+            for url, (_, timestamp) in list(self.client_cache.items()):
+                if (current_time - timestamp) > client_cache_ttl_seconds:
+                    clients_to_remove.append(url)
+                    
+            for url in clients_to_remove:
+                self.client_cache.pop(url, None)
+                logger.debug(f"Cleaned up cached client for URL {url} due to TTL expiration")
+                
+        # Clean up agent card cache
+        agent_card_ttl_seconds = self.agent_card_ttl_hours * 3600
+        cards_to_remove = []
+        
+        for agent_name, timestamp in list(self.agent_card_timestamps.items()):
+            if (current_time - timestamp) > agent_card_ttl_seconds:
+                cards_to_remove.append(agent_name)
+                
+        for agent_name in cards_to_remove:
+            if agent_name in self.cache:
+                self.cache.pop(agent_name)
+                self.agent_card_timestamps.pop(agent_name, None)
+                logger.debug(f"Cleaned up agent card for {agent_name} due to TTL expiration")
+                
+        # Check if we need to evict more agent cards based on size limit
+        if len(self.cache) > self.max_agent_cards:
+            # Calculate how many to remove
+            num_to_remove = len(self.cache) - self.max_agent_cards + 2  # Remove extra to avoid frequent evictions
+            
+            # Sort by timestamp (oldest first)
+            sorted_cards = sorted(
+                self.agent_card_timestamps.items(),
+                key=lambda x: x[1]
+            )
+            
+            # Remove oldest cards beyond the ones already removed due to TTL
+            additional_cards_to_remove = [
+                agent_name for agent_name, _ in sorted_cards[:num_to_remove]
+                if agent_name not in cards_to_remove  # Don't double count the ones already removed
+            ]
+            
+            for agent_name in additional_cards_to_remove:
+                if agent_name in self.cache:
+                    self.cache.pop(agent_name)
+                    self.agent_card_timestamps.pop(agent_name, None)
+                    logger.debug(f"Evicted agent card for {agent_name} due to cache size limit")
+        
+        # Clean up stale active requests (those that haven't been updated in a long time)
+        # Use half of the execution log TTL as a reasonable timeout for active requests
+        active_request_ttl_seconds = execution_log_ttl_seconds / 2
+        active_requests_to_remove = []
+        
+        for request_id, timestamp in list(self.last_update_time.items()):
+            if (current_time - timestamp) > active_request_ttl_seconds:
+                active_requests_to_remove.append(request_id)
+        
+        for request_id in active_requests_to_remove:
+            # Get request info before removing it
+            request_info = self.active_requests.get(request_id, {})
+            agent_name = request_info.get("agent_name", "unknown")
+            
+            # Remove from active requests, last update time, and update throttler
+            self.active_requests.pop(request_id, None)
+            self.last_update_time.pop(request_id, None)
+            self.update_throttler.clear(request_id)
+            
+            logger.warning(
+                f"Cleaned up stale active request {request_id} to agent {agent_name} "
+                f"due to inactivity (no updates for {active_request_ttl_seconds//3600} hours)"
+            )
+            
+            # Add to execution logs if not already there
+            if request_id not in self.execution_logs:
+                self.execution_logs[request_id] = []
+                
+            # Add a final log entry
+            log_entry = {
+                "timestamp": current_time,
+                "status": "failed",
+                "message": f"Request timed out due to inactivity (no updates for {active_request_ttl_seconds//3600} hours)",
+                "chain_position": request_info.get("chain_position", {"current": 1, "total": 1}),
+            }
+            self.execution_logs[request_id].append(log_entry)
+            self.execution_log_timestamps[request_id] = current_time
+        
+        logger.info(
+            f"TTL cleanup complete: Removed {len(logs_to_remove)} execution logs, "
+            f"{len(pipelines_to_remove)} pipeline states, {len(clients_to_remove)} cached clients, "
+            f"{len(cards_to_remove) + len(additional_cards_to_remove) if 'additional_cards_to_remove' in locals() else len(cards_to_remove)} agent cards, "
+            f"and {len(active_requests_to_remove)} stale active requests"
+        )
+        
+    async def get_a2a_min_client(self, url: str) -> A2aMinClient:
+        """
+        Get or create an A2aMinClient for the given URL.
+        Uses a cached client if available and not expired.
+        
+        Args:
+            url: The URL for the A2A server
+            
+        Returns:
+            An A2aMinClient instance
+        """
+        current_time = time.time()
+        client_cache_ttl_seconds = self.client_cache_ttl_minutes * 60
+        
+        # Check if we have a cached client
+        async with self.client_cache_lock:
+            if url in self.client_cache:
+                client, timestamp = self.client_cache[url]
+                
+                # Check if the client is still valid
+                if (current_time - timestamp) < client_cache_ttl_seconds:
+                    logger.debug(f"Using cached A2aMinClient for URL: {url}")
+                    # Update the timestamp to implement LRU behavior
+                    self.client_cache[url] = (client, current_time)
+                    return client
+                else:
+                    # Client is expired, remove it
+                    logger.debug(f"Cached A2aMinClient for URL {url} expired, creating new one")
+                    self.client_cache.pop(url)
+        
+        # Create a new client
+        logger.debug(f"Creating new A2aMinClient for URL: {url}")
+        client = A2aMinClient.connect(url)
+        
+        # Cache the client
+        async with self.client_cache_lock:
+            # Check if we need to evict old clients before adding a new one
+            if len(self.client_cache) >= self.max_client_cache:
+                await self._evict_old_client_cache()
+                
+            # Add the new client to the cache
+            self.client_cache[url] = (client, current_time)
+            
+        return client
 
     async def call_agent_for_pipeline(
         self,
@@ -447,7 +794,7 @@ class ServerState:
         request_id: str,
         task_id: str,
         session_id: str,
-        ctx,
+        ctx, # This is a NodeExecutionContext from engine.py
     ) -> Dict[str, Any]:
         """
         Call an agent as part of a pipeline.
@@ -457,226 +804,137 @@ class ServerState:
             prompt: Prompt to send to the agent
             pipeline_id: The pipeline ID
             node_id: The node ID within the pipeline
-            request_id: The request ID
+            request_id: The MCP request ID for this specific agent call
             task_id: The A2A task ID
             session_id: The A2A session ID
-            ctx: The context for progress reporting
+            ctx: The NodeExecutionContext for progress reporting
 
         Returns:
-            Dict with status information
+            Dict with status information including artifacts and node_status
         """
+        logger.info(f"PIPELINE NODE CALL: agent='{agent_name}', node='{node_id}', pipeline='{pipeline_id}', prompt='{prompt[:50]}...'")
+        
+        # Get NodeState object to store artifacts directly
+        pipeline_state_obj = self.pipelines.get(pipeline_id)
+        if not pipeline_state_obj:
+            # This should not happen if engine calls this correctly
+            await ctx.error(f"Pipeline state for {pipeline_id} not found.")
+            return {"status": "error", "message": "Pipeline state not found", "artifacts": []}
+        
+        node_state_obj = pipeline_state_obj.nodes.get(node_id)
+        if not node_state_obj:
+            await ctx.error(f"Node state for {node_id} in {pipeline_id} not found.")
+            return {"status": "error", "message": "Node state not found", "artifacts": []}
+
+        # Agent URL and client setup
+        if agent_name not in self.registry:
+            err_msg = f"Agent '{agent_name}' not found in registry for node '{node_id}'"
+            logger.error(err_msg)
+            await ctx.error(err_msg)
+            return {"status": "error", "message": err_msg, "artifacts": [], "node_status": "failed"}
+        
+        url = self.registry[agent_name]
+        client = await self.get_a2a_min_client(url)
+        agent_card = self.cache.get(agent_name) # Assumes cache is populated
+        supports_streaming = agent_has_capability(agent_card, "streaming")
+        
+        a2a_message = Message(role="user", parts=[TextPart(text=prompt)])
+
         try:
-            logger.debug(
-                f"call_agent_for_pipeline called with agent_name={agent_name}, prompt={prompt[:50]}..."
-            )
-            logger.debug(f"Current registry: {self.registry}")
+            await ctx.report_progress(current=0.05, total=1.0, message=f"Contacting agent {agent_name}...")
 
-            # Verify the agent exists
-            if agent_name not in self.registry:
-                error_msg = f"Agent '{agent_name}' not found in registry"
-                logger.warning(error_msg)
-                await ctx.error(error_msg)
-                return {"status": "error", "message": error_msg}
-
-            # Get the URL for the agent
-            url = self.registry[agent_name]
-            logger.debug(f"Using URL: {url}")
-
-            try:
-                # A2aMinClient handles URL normalization internally (base_url not needed)
-
-                # Track request with pipeline info
-                self.track_request(
-                    request_id=request_id,
-                    agent_name=agent_name,
-                    task_id=task_id,
-                    session_id=session_id,
-                    pipeline_id=pipeline_id,
-                    node_id=node_id,
+            if supports_streaming:
+                logger.debug(f"Node '{node_id}': Streaming call to {agent_name} with task_id={task_id}")
+                streaming_task_resp = await client.send_message_streaming(
+                    message=a2a_message, task_id=task_id, session_id=session_id
                 )
+                
+                # Get the stream updates by awaiting the coroutine first
+                stream_updates = await streaming_task_resp.stream_updates()
+                async for update in stream_updates:
+                    logger.debug(f"Node '{node_id}': Stream update from {agent_name}: {update.status.state if update.status else 'N/A'}")
+                    
+                    state_str = update.status.state if update.status else "working"
+                    prog_float = update.status.progress if update.status else 0.0
+                    msg_str = update.status.message if update.status else "Processing..."
+                    arts_list = [art.model_dump() if hasattr(art, "model_dump") else vars(art) for art in (update.artifacts or [])]
 
-                # Update initial status with context
-                await self.update_request_status(
-                    request_id=request_id,
-                    status="submitted",
-                    message=f"Sending prompt to {agent_name}",
-                    ctx=ctx,
+                    node_status_enum = NodeStatus(state_str)
+
+                    if node_status_enum == NodeStatus.COMPLETED:
+                        node_state_obj.artifacts = arts_list
+                        await ctx.complete(msg_str)
+                        # Return immediately after a terminal state from agent
+                        return {"status": "success", "message": msg_str, "artifacts": arts_list, "node_status": node_status_enum.value}
+                    elif node_status_enum == NodeStatus.FAILED:
+                        await ctx.error(msg_str)
+                        return {"status": "error", "message": msg_str, "artifacts": arts_list, "node_status": node_status_enum.value}
+                    elif node_status_enum == NodeStatus.INPUT_REQUIRED:
+                        node_state_obj.status = NodeStatus.INPUT_REQUIRED # Critical: update NodeState directly
+                        node_state_obj.message = msg_str
+                        node_state_obj.progress = prog_float
+                        pipeline_state_obj.update_status() # Update overall pipeline status
+                        await ctx.parent_ctx.report_progress( # Report to main pipeline context
+                            current=pipeline_state_obj.progress, total=1.0, message=pipeline_state_obj.message
+                        )
+                        return {"status": "input_required", "message": msg_str, "artifacts": arts_list, "node_status": node_status_enum.value}
+                    else: # WORKING, SUBMITTED
+                        await ctx.report_progress(current=prog_float, total=1.0, message=msg_str)
+                
+                # If stream ends without a terminal update, consider it completed by the node.
+                # The NodeExecutionContext (ctx) should already reflect the last progress.
+                # We need to ensure ctx.complete() is called if the node implicitly completed.
+                if node_state_obj.status not in [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.CANCELED, NodeStatus.INPUT_REQUIRED]:
+                    logger.info(f"Node '{node_id}': Stream ended for {agent_name} without explicit completion. Marking complete.")
+                    await ctx.complete(f"Agent {agent_name} stream finished.")
+                    # Artifacts should have been collected from the last relevant update.
+
+            else: # Non-streaming
+                logger.debug(f"Node '{node_id}': Non-streaming call to {agent_name} with task_id={task_id}")
+                await ctx.report_progress(current=0.5, total=1.0, message=f"Processing with {agent_name}...")
+                
+                response = await client.send_message(
+                    message=a2a_message, task_id=task_id, session_id=session_id
                 )
+                
+                logger.debug(f"Node '{node_id}': Non-streaming response from {agent_name}: {response.status.state if response.status else 'N/A'}")
 
-                # Prepare the JSON-RPC request using tasks/sendSubscribe for streaming updates
-                json_rpc_request = {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": "tasks/sendSubscribe",
-                    "params": {
-                        "id": task_id,
-                        "sessionId": session_id,
-                        "message": {
-                            "role": "user",
-                            "parts": [{"type": "text", "text": prompt}],
-                        },
-                    },
+                state_str = response.status.state if response.status else "completed"
+                msg_str = response.status.message if response.status else "Task completed by agent."
+                arts_list = [art.model_dump() if hasattr(art, "model_dump") else vars(art) for art in (response.artifacts or [])]
+                node_status_enum = NodeStatus(state_str)
+
+                node_state_obj.artifacts = arts_list
+                if node_status_enum == NodeStatus.FAILED:
+                    await ctx.error(msg_str)
+                else: # Treat as COMPLETED if not FAILED
+                    await ctx.complete(msg_str)
+                
+                return {
+                    "status": "success" if node_status_enum == NodeStatus.COMPLETED else "error", 
+                    "message": msg_str, "artifacts": arts_list, "node_status": node_status_enum.value
                 }
 
-                logger.debug(
-                    f"Sending JSON-RPC request: {json.dumps(json_rpc_request)}"
-                )
-
-                # Update status to working
-                await self.update_request_status(
-                    request_id=request_id,
-                    status="working",
-                    message=f"Connected to {agent_name}, waiting for response...",
-                    ctx=ctx,
-                )
-
-                # Use A2aMinClient for pipeline agent communication
-                try:
-                    # Create A2A min client
-                    client = A2aMinClient.connect(url)
-
-                    # Create message for pipeline input
-                    message = Message(role="user", parts=[TextPart(text=prompt)])
-
-                    logger.debug(
-                        f"Using A2aMinClient to send streaming message to {agent_name} for pipeline"
-                    )
-
-                    # Update status to working
-                    await self.update_request_status(
-                        request_id=request_id,
-                        status="working",
-                        message=f"Connected to {agent_name}, waiting for response...",
-                        ctx=ctx,
-                    )
-
-                    # Send message with streaming for pipeline
-                    try:
-                        # Send message with streaming
-                        streaming_task = await client.send_message_streaming(
-                            message=message, task_id=task_id, session_id=session_id
-                        )
-
-                        # Process streaming updates
-                        async for update in streaming_task.stream_updates():
-                            logger.debug(
-                                f"Received pipeline streaming update: {update}"
-                            )
-
-                            # Process the update using our existing mechanism
-                            # We need to convert the a2a_min update to our expected format
-                            converted_update = {
-                                "jsonrpc": "2.0",
-                                "id": request_id,
-                                "result": {
-                                    "id": task_id,
-                                    "status": {
-                                        "state": update.status.state
-                                        if update.status
-                                        else "working",
-                                        "message": update.status.message
-                                        if update.status
-                                        else "",
-                                        "progress": update.status.progress
-                                        if update.status
-                                        else 0.0,
-                                    },
-                                    "artifacts": [
-                                        artifact.model_dump()
-                                        if hasattr(artifact, "model_dump")
-                                        else vars(artifact)
-                                        for artifact in (update.artifacts or [])
-                                    ],
-                                },
-                            }
-
-                            # Process the converted update
-                            await process_agent_update(
-                                request_id, agent_name, converted_update, ctx
-                            )
-
-                            # Store artifacts
-                            if update.artifacts:
-                                self.active_requests[request_id]["artifacts"] = [
-                                    artifact.model_dump()
-                                    if hasattr(artifact, "model_dump")
-                                    else vars(artifact)
-                                    for artifact in update.artifacts
-                                ]
-
-                        # Mark as completed if we haven't already
-                        request_info = self.get_request_info(request_id)
-                        if request_info and request_info.get("status") not in [
-                            "completed",
-                            "failed",
-                            "canceled",
-                        ]:
-                            await self.update_request_status(
-                                request_id=request_id,
-                                status="completed",
-                                progress=1.0,
-                                message=f"Completed response from {agent_name}",
-                                ctx=ctx,
-                            )
-
-                    except Exception as e:
-                        logger.exception(f"Error in pipeline streaming task: {e}")
-
-                        # Update status to failed
-                        await self.update_request_status(
-                            request_id=request_id,
-                            status="failed",
-                            message=f"Error: {str(e)}",
-                            ctx=ctx,
-                        )
-
-                        return {
-                            "status": "error",
-                            "message": f"Error in pipeline streaming task: {str(e)}",
-                            "request_id": request_id,
-                        }
-
-                    # Extract artifacts from the completed request
-                    request_info = self.get_request_info(request_id)
-                    artifacts = (
-                        request_info.get("artifacts", []) if request_info else []
-                    )
-
-                    # Return the final status
-                    return {
-                        "status": "success",
-                        "message": "Task completed",
-                        "request_id": request_id,
-                        "artifacts": artifacts,
-                    }
-
-                except Exception as e:
-                    logger.exception(
-                        f"Error processing streaming response for {request_id}: {e}"
-                    )
-
-                    # Update status to failed
-                    await self.update_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        message=f"Error: {str(e)}",
-                        ctx=ctx,
-                    )
-
-                    return {
-                        "status": "error",
-                        "message": f"Error processing response: {str(e)}",
-                        "request_id": request_id,
-                    }
-
-            except Exception as e:
-                logger.exception(f"Error calling agent {agent_name}: {e}")
-                await ctx.error(f"Error calling agent: {str(e)}")
-                return {"status": "error", "message": f"Error calling agent: {str(e)}"}
+        except asyncio.TimeoutError: # This will be raised by asyncio.wait_for in _execute_node
+            logger.error(f"Node '{node_id}': Agent call to {agent_name} timed out.")
+            # _execute_node will call ctx.error
+            raise # Re-raise for _execute_node to handle
         except Exception as e:
-            logger.exception(f"Error in call_agent_for_pipeline: {str(e)}")
-            await ctx.error(f"Error: {str(e)}")
-            return {"status": "error", "message": f"Error: {str(e)}"}
+            err_msg = f"Node '{node_id}': Exception calling agent {agent_name}: {str(e)}"
+            logger.exception(err_msg)
+            await ctx.error(err_msg) # Report error via NodeExecutionContext
+            return {"status": "error", "message": err_msg, "artifacts": [], "node_status": NodeStatus.FAILED.value}
+
+        # This part should ideally be reached if the agent interaction completed successfully
+        # and was handled by one of the terminal conditions above (complete, error, input_required)
+        # If the stream ended and no terminal state was hit, it implies completion.
+        # The node_state_obj.status should reflect the outcome.
+        return {
+            "status": "success" if node_state_obj.status == NodeStatus.COMPLETED else node_state_obj.status.value,
+            "message": node_state_obj.message,
+            "artifacts": node_state_obj.artifacts,
+            "node_status": node_state_obj.status.value
+        }
 
     def export_execution_log(
         self, request_id: str, format_type: Literal["text", "json"] = "text"
@@ -760,18 +1018,57 @@ async def fetch_agent_card(url: str) -> Optional[AgentCard]:
         return None
 
 
+def agent_has_capability(agent_card: Optional[AgentCard], capability: str) -> bool:
+    """
+    Check if an agent has a specific capability.
+    
+    Args:
+        agent_card: The agent card to check
+        capability: The capability name to check for
+        
+    Returns:
+        bool: True if the agent has the capability, False otherwise
+    """
+    if agent_card is None:
+        # If we can't fetch the agent card, assume no capabilities
+        return False
+        
+    # Check the capabilities directly if it exists
+    capabilities = getattr(agent_card, "capabilities", None)
+    if capabilities is None:
+        # No capabilities field in the card
+        return False
+        
+    # AgentCard might return capabilities as a dict, or it might have
+    # a structured object with attributes, so we handle both cases
+    if isinstance(capabilities, dict):
+        return capabilities.get(capability, False)
+    else:
+        return getattr(capabilities, capability, False)
+
+
 async def update_agent_cache() -> None:
     """Update the cache of agent cards."""
     logger.info("Updating agent cache...")
     new_cache = {}
+    current_time = time.time()
+    card_timestamps = {}
+    
     for name, url in state.registry.items():
         card = await fetch_agent_card(url)
         if card:
             new_cache[name] = card
+            card_timestamps[name] = current_time
             logger.info(f"Added agent {name} to cache: {card.name}")
 
-    # Update the state cache
+    # Update the state cache and timestamps
     state.cache = new_cache
+    state.agent_card_timestamps = card_timestamps
+    
+    # Check if we need to evict agent cards based on size limit
+    if len(state.cache) > state.max_agent_cards:
+        state._evict_old_agent_cards()
+        
     logger.info(f"Agent cache updated with {len(state.cache)} agents")
 
 
@@ -835,6 +1132,10 @@ async def execute_pipeline(
         pipeline_id = await state.pipeline_engine.execute_pipeline(
             pipeline_def, input_text, ctx
         )
+        
+        # Enforce pipeline size limits if needed
+        if len(state.pipelines) > state.max_pipelines:
+            state._evict_old_pipelines()
 
         logger.info(f"Started pipeline execution: {pipeline_id}")
 
@@ -1092,7 +1393,7 @@ async def list_agents(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, Any]:
+async def call_agent(agent_name: str, prompt: str, ctx: Context, timeout: Optional[float] = None) -> Dict[str, Any]:
     """
     Call an agent with a prompt and stream progress updates.
 
@@ -1100,6 +1401,7 @@ async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, An
         agent_name: Name of the agent to call
         prompt: Prompt to send to the agent
         ctx: The FastMCP context for progress reporting
+        timeout: Optional timeout in seconds for the agent call
 
     Returns:
         Dict with status information
@@ -1175,15 +1477,18 @@ async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, An
 
             # Use A2aMinClient to send the message with streaming
             try:
-                # Create A2A min client
-                client = A2aMinClient.connect(url)
+                # Get or create A2A min client using the caching mechanism
+                client = await state.get_a2a_min_client(url)
 
                 # Create text message
                 message = Message(role="user", parts=[TextPart(text=prompt)])
 
-                # Send message with streaming
+                # Check if the agent supports streaming before using it
+                agent_card = state.cache.get(agent_name)
+                supports_streaming = agent_has_capability(agent_card, "streaming")
+
                 logger.debug(
-                    f"Using A2aMinClient to send streaming message to {agent_name}"
+                    f"Agent {agent_name} streaming capability: {supports_streaming}"
                 )
 
                 # Update status to working
@@ -1194,87 +1499,186 @@ async def call_agent(agent_name: str, prompt: str, ctx: Context) -> Dict[str, An
                     ctx=ctx,
                 )
 
-                # Use the streaming API
-                try:
-                    # Send message with streaming
-                    streaming_task = await client.send_message_streaming(
-                        message=message, task_id=task_id, session_id=session_id
-                    )
+                # Define async function to handle both streaming and non-streaming cases
+                async def process_agent_call():
+                    if supports_streaming:
+                        # Send message with streaming
+                        logger.debug(
+                            f"Using A2aMinClient to send streaming message to {agent_name}"
+                        )
 
-                    # Process streaming updates
-                    async for update in streaming_task.stream_updates():
-                        logger.debug(f"Received streaming update: {update}")
+                        try:
+                            # Send message with streaming
+                            streaming_task = await client.send_message_streaming(
+                                message=message, task_id=task_id, session_id=session_id
+                            )
 
-                        # Process the update using our existing mechanism
-                        # We need to convert the a2a_min update to our expected format
+                            # Process streaming updates
+                            async for update in streaming_task.stream_updates():
+                                logger.debug(f"Received streaming update: {update}")
+
+                                # Process the update using our existing mechanism
+                                # We need to convert the a2a_min update to our expected format
+                                converted_update = {
+                                    "jsonrpc": "2.0",
+                                    "id": mcp_request_id,
+                                    "result": {
+                                        "id": task_id,
+                                        "status": {
+                                            "state": update.status.state
+                                            if update.status
+                                            else "working",
+                                            "message": update.status.message
+                                            if update.status
+                                            else "",
+                                            "progress": update.status.progress
+                                            if update.status
+                                            else 0.0,
+                                        },
+                                        "artifacts": [
+                                            artifact.model_dump()
+                                            if hasattr(artifact, "model_dump")
+                                            else vars(artifact)
+                                            for artifact in (update.artifacts or [])
+                                        ],
+                                    },
+                                }
+
+                                # Process the converted update
+                                await process_agent_update(
+                                    mcp_request_id, agent_name, converted_update, ctx
+                                )
+
+                            # Mark as completed if we haven't already
+                            request_info = state.get_request_info(mcp_request_id)
+                            if request_info and request_info.get("status") not in [
+                                "completed",
+                                "failed",
+                                "canceled",
+                            ]:
+                                await state.update_request_status(
+                                    request_id=mcp_request_id,
+                                    status="completed",
+                                    progress=1.0,
+                                    message=f"Completed response from {agent_name}",
+                                    ctx=ctx,
+                                )
+
+                        except Exception as e:
+                            logger.exception(f"Error in streaming task: {e}")
+
+                            # Update status to failed
+                            await state.update_request_status(
+                                request_id=mcp_request_id,
+                                status="failed",
+                                message=f"Error: {str(e)}",
+                                ctx=ctx,
+                            )
+
+                            return {
+                                "status": "error",
+                                "message": f"Error in streaming task: {str(e)}",
+                                "request_id": mcp_request_id,
+                            }
+                    
+                    else:
+                        # Non-streaming fallback for agents that don't support streaming
+                        logger.debug(
+                            f"Using A2aMinClient to send non-streaming message to {agent_name}"
+                        )
+                        
+                        # Intermediate progress update
+                        await state.update_request_status(
+                            request_id=mcp_request_id,
+                            status="working",
+                            progress=0.5,
+                            message=f"Processing request with {agent_name}...",
+                            ctx=ctx,
+                        )
+                        
+                        # Send message without streaming
+                        response = await client.send_message(
+                            message=message, task_id=task_id, session_id=session_id
+                        )
+                        
+                        # Log the response
+                        logger.debug(f"Received non-streaming response: {response}")
+                        
+                        # Process the response using our existing mechanism
+                        # We need to convert the a2a_min response to our expected format
                         converted_update = {
                             "jsonrpc": "2.0",
                             "id": mcp_request_id,
                             "result": {
                                 "id": task_id,
                                 "status": {
-                                    "state": update.status.state
-                                    if update.status
-                                    else "working",
-                                    "message": update.status.message
-                                    if update.status
-                                    else "",
-                                    "progress": update.status.progress
-                                    if update.status
-                                    else 0.0,
+                                    "state": response.status.state
+                                    if response.status
+                                    else "completed",
+                                    "message": response.status.message
+                                    if response.status
+                                    else "Request completed",
+                                    "progress": response.status.progress
+                                    if response.status
+                                    else 1.0,
                                 },
                                 "artifacts": [
                                     artifact.model_dump()
                                     if hasattr(artifact, "model_dump")
                                     else vars(artifact)
-                                    for artifact in (update.artifacts or [])
+                                    for artifact in (response.artifacts or [])
                                 ],
                             },
                         }
-
+                        
                         # Process the converted update
                         await process_agent_update(
                             mcp_request_id, agent_name, converted_update, ctx
                         )
-
-                    # Mark as completed if we haven't already
-                    request_info = state.get_request_info(mcp_request_id)
-                    if request_info and request_info.get("status") not in [
-                        "completed",
-                        "failed",
-                        "canceled",
-                    ]:
-                        await state.update_request_status(
-                            request_id=mcp_request_id,
-                            status="completed",
-                            progress=1.0,
-                            message=f"Completed response from {agent_name}",
-                            ctx=ctx,
-                        )
-
-                except Exception as e:
-                    logger.exception(f"Error in streaming task: {e}")
-
-                    # Update status to failed
-                    await state.update_request_status(
-                        request_id=mcp_request_id,
-                        status="failed",
-                        message=f"Error: {str(e)}",
-                        ctx=ctx,
-                    )
-
+                    
                     return {
-                        "status": "error",
-                        "message": f"Error in streaming task: {str(e)}",
+                        "status": "success",
+                        "message": "Task completed",
                         "request_id": mcp_request_id,
                     }
 
-                # Return the final status
-                return {
-                    "status": "success",
-                    "message": "Task completed",
-                    "request_id": mcp_request_id,
-                }
+                # Apply timeout if specified
+                if timeout:
+                    logger.info(f"Executing call to agent {agent_name} with timeout of {timeout} seconds")
+                    try:
+                        return await asyncio.wait_for(
+                            process_agent_call(),
+                            timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        error_msg = f"Agent call timed out after {timeout} seconds"
+                        logger.error(f"Timeout for call to agent {agent_name}: {error_msg}")
+                        
+                        # Update status to failed
+                        await state.update_request_status(
+                            request_id=mcp_request_id,
+                            status="failed",
+                            message=f"Execution timed out: {error_msg}",
+                            ctx=ctx,
+                        )
+                        
+                        # Attempt to cancel the ongoing task
+                        try:
+                            await state.cancel_request(mcp_request_id)
+                            logger.info(f"Successfully canceled timed-out request {mcp_request_id}")
+                        except Exception as cancel_error:
+                            logger.warning(
+                                f"Failed to cancel timed-out request {mcp_request_id}: {str(cancel_error)}"
+                            )
+                        
+                        return {
+                            "status": "error",
+                            "message": f"Timeout: {error_msg}",
+                            "request_id": mcp_request_id,
+                        }
+                else:
+                    # No timeout specified, execute normally
+                    return await process_agent_call()
 
             except Exception as e:
                 logger.exception(
@@ -1472,6 +1876,16 @@ async def send_input(request_id: str, input_text: str, ctx: Context) -> Dict[str
             return {"status": "error", "message": error_msg}
 
         url = state.registry[agent_name]
+        
+        # Check if the agent supports input-required state
+        agent_card = state.cache.get(agent_name)
+        supports_input = agent_has_capability(agent_card, "input-required")
+        
+        if not supports_input:
+            error_msg = f"Agent '{agent_name}' does not support additional input"
+            logger.warning(error_msg)
+            await ctx.error(error_msg)
+            return {"status": "error", "message": error_msg}
 
         # Prepare the URL (we only need it for client construction, not for JSON-RPC)
         # A2aMinClient handles URL normalization internally
@@ -1507,8 +1921,8 @@ async def send_input(request_id: str, input_text: str, ctx: Context) -> Dict[str
 
         # Use A2aMinClient to send input
         try:
-            # Create A2A min client
-            client = A2aMinClient.connect(url)
+            # Get or create A2A min client using the caching mechanism
+            client = await state.get_a2a_min_client(url)
 
             # Create message for input
             message = Message(role="user", parts=[TextPart(text=input_text)])
@@ -1633,6 +2047,35 @@ async def cancel_request(request_id: str, ctx: Context) -> Dict[str, Any]:
 
         url = state.registry[agent_name]
         logger.debug(f"Using URL for cancel: {url}")
+        
+        # Check if the agent supports cancellation
+        agent_card = state.cache.get(agent_name)
+        supports_cancel = agent_has_capability(agent_card, "cancellation")
+        
+        if not supports_cancel:
+            # If agent doesn't support cancellation, we'll mark it as canceled locally
+            # but inform the user that the agent might continue processing
+            logger.warning(f"Agent '{agent_name}' does not support cancellation")
+            
+            # Update our local state anyway
+            await state.update_request_status(
+                request_id=request_id,
+                status="canceled",
+                message=f"Request to {agent_name} was marked as canceled locally. The agent may still continue processing.",
+                ctx=ctx,
+            )
+            
+            # Report partial success
+            await ctx.report_progress(
+                current=1.0,
+                total=1.0,
+                message=f"Request {request_id} marked as canceled locally (agent does not support cancellation)",
+            )
+            
+            return {
+                "status": "partial_success",
+                "message": f"Request marked as canceled locally, but {agent_name} may continue processing as it doesn't support cancellation.",
+            }
 
         # Prepare the URL (we only need it for client construction, not for JSON-RPC)
         # A2aMinClient handles URL normalization internally
@@ -1655,8 +2098,8 @@ async def cancel_request(request_id: str, ctx: Context) -> Dict[str, Any]:
 
         # Use A2aMinClient to cancel task
         try:
-            # Create A2A min client
-            client = A2aMinClient.connect(url)
+            # Get or create A2A min client using the caching mechanism
+            client = await state.get_a2a_min_client(url)
 
             logger.debug(f"Using A2aMinClient to cancel task for {agent_name}")
 
@@ -2001,8 +2444,8 @@ async def cancel_pipeline(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
                     agent_url = state.registry[agent_name]
 
                     try:
-                        # Create a2a_min client for the agent
-                        client = A2aMinClient.connect(agent_url)
+                        # Get or create A2A min client using the caching mechanism
+                        client = await state.get_a2a_min_client(agent_url)
 
                         # Send the cancel request
                         await ctx.report_progress(
@@ -2135,8 +2578,8 @@ async def send_pipeline_input(
                 message=pipeline_state.message,
             )
 
-            # Create a2a_min client for the agent
-            client = A2aMinClient.connect(url)
+            # Get or create A2A min client using the caching mechanism
+            client = await state.get_a2a_min_client(url)
 
             # Create a message from the input text
             message = Message(role="user", parts=[TextPart(text=input_text)])
