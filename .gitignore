@@ -3,7 +3,6 @@
 *.mdc
 !/agents/README.md
 !/README.md
-!/pr-review-gemini.md
 # Ensure CLAUDE.md is ignored regardless of other patterns
 /CLAUDE.md
 

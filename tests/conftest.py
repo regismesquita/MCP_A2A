@@ -59,6 +59,7 @@ async def server_state():
     # This ensures tests don't interfere with each other
     for pipeline_id in list(state.pipelines.keys()):
         # Cancel any active tasks by setting status to canceled
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import PipelineStatus
         pipeline_state = state.pipelines[pipeline_id]
         pipeline_state.status = PipelineStatus.CANCELED

@@ -116,6 +116,7 @@ async def test_pipeline_execution(server_state, mock_context, mock_a2a_client, c
 
     # Import function to test
     from a2a_mcp_server.server import execute_pipeline
+    # Import from the pipeline package (not the redundant pipeline.py file)
     from a2a_mcp_server.pipeline import PipelineExecutionEngine, PipelineStatus
 
     try:
@@ -305,6 +306,7 @@ async def test_pipeline_error_handling(server_state, mock_context, mock_a2a_clie
 
     # Import functions
     from a2a_mcp_server.server import execute_pipeline
+    # Import from the pipeline package (not the redundant pipeline.py file)
     from a2a_mcp_server.pipeline import PipelineExecutionEngine, NodeStatus, PipelineStatus, ErrorPolicy
 
     try:
@@ -499,6 +501,7 @@ async def test_pipeline_continue_error_policy(
 
     # Import functions
     from a2a_mcp_server.server import execute_pipeline
+    # Import from the pipeline package (not the redundant pipeline.py file)
     from a2a_mcp_server.pipeline import (
         PipelineExecutionEngine,
         NodeStatus,
@@ -724,6 +727,7 @@ async def test_pipeline_input_handling(server_state, mock_context, mock_a2a_clie
 
     # Import functions
     from a2a_mcp_server.server import execute_pipeline, send_pipeline_input
+    # Import from the pipeline package (not the redundant pipeline.py file)
     from a2a_mcp_server.pipeline import PipelineExecutionEngine, NodeStatus, PipelineStatus
 
     try:

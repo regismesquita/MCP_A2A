@@ -1110,6 +1110,7 @@ async def execute_pipeline(
         )
 
         # Import the required classes
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import PipelineDefinition
 
         try:
@@ -2258,6 +2259,7 @@ async def save_pipeline_template(
         )
 
         # Import the required classes
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import PipelineDefinition
 
         try:
@@ -2419,6 +2421,7 @@ async def cancel_pipeline(pipeline_id: str, ctx: Context) -> Dict[str, Any]:
         )
 
         # Update pipeline status to canceled
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import NodeStatus, PipelineStatus
 
         pipeline_state.status = PipelineStatus.CANCELED
@@ -2523,6 +2526,7 @@ async def send_pipeline_input(
             return {"status": "error", "message": error_msg}
 
         # Get the node state
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import NodeStatus
 
         node_state = pipeline_state.nodes[node_id]
@@ -2754,6 +2758,7 @@ async def list_requests(ctx: Context) -> Dict[str, Any]:
 def main():
     """Run the MCP server."""
     # Import the pipeline module and initialize the pipeline engine
+    # Import from the pipeline package (not the redundant pipeline.py file)
     from a2a_mcp_server.pipeline import PipelineExecutionEngine
 
     state.pipeline_engine = PipelineExecutionEngine(state)

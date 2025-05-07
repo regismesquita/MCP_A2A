@@ -161,6 +161,7 @@ async def test_pipeline_progress_reporting(server_state):
     from a2a_mcp_server.server import execute_pipeline
 
     try:
+        # Import from the pipeline package (not the redundant pipeline.py file)
         from a2a_mcp_server.pipeline import PipelineExecutionEngine
 
         server_state.pipeline_engine = PipelineExecutionEngine(server_state)
