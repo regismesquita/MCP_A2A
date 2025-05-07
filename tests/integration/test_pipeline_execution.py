@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
 from typing import Callable, Any, Optional
@@ -175,8 +176,8 @@ async def test_pipeline_execution(server_state, mock_context, mock_a2a_client, c
     agent1_stream = MockStreamResponse(agent1_updates, delay_between_updates=0.05)
     agent2_stream = MockStreamResponse(agent2_updates, delay_between_updates=0.05)
 
-    agent1_client.send_message_streaming.return_value = agent1_stream
-    agent2_client.send_message_streaming.return_value = agent2_stream
+    agent1_client.send_message_streaming = AsyncMock(return_value=agent1_stream)
+    agent2_client.send_message_streaming = AsyncMock(return_value=agent2_stream)
 
     # Configure client factory to return agent-specific clients
     def mock_connect_for_pipeline(url, *args, **kwargs):
@@ -357,16 +358,16 @@ async def test_pipeline_error_handling(server_state, mock_context, mock_a2a_clie
     agent2_stream = MockStreamResponse(agent2_updates, delay_between_updates=0.05)
     
     # We won't use agent3 or agent4 due to fail_fast policy, but configure them anyway
-    agent3_client.send_message_streaming.return_value = MockStreamResponse(
+    agent3_client.send_message_streaming = AsyncMock(return_value=MockStreamResponse(
         [MockUpdateObject("completed", "Success", 1.0)], delay_between_updates=0.05
-    )
-    agent4_client.send_message_streaming.return_value = MockStreamResponse(
+    ))
+    agent4_client.send_message_streaming = AsyncMock(return_value=MockStreamResponse(
         [MockUpdateObject("completed", "Success", 1.0)], delay_between_updates=0.05
-    )
+    ))
 
     # Configure streaming responses for each agent
-    agent1_client.send_message_streaming.return_value = agent1_stream
-    agent2_client.send_message_streaming.return_value = agent2_stream
+    agent1_client.send_message_streaming = AsyncMock(return_value=agent1_stream)
+    agent2_client.send_message_streaming = AsyncMock(return_value=agent2_stream)
 
     # Configure client factory to return agent-specific clients
     def mock_connect_for_error_test(url, *args, **kwargs):
@@ -589,9 +590,9 @@ async def test_pipeline_continue_error_policy(
     agent3_stream = MockStreamResponse(agent3_updates, delay_between_updates=0.05)
 
     # Set up the streaming responses
-    agent1_client.send_message_streaming.return_value = agent1_stream
-    agent2_client.send_message_streaming.return_value = agent2_stream
-    agent3_client.send_message_streaming.return_value = agent3_stream
+    agent1_client.send_message_streaming = AsyncMock(return_value=agent1_stream)
+    agent2_client.send_message_streaming = AsyncMock(return_value=agent2_stream)
+    agent3_client.send_message_streaming = AsyncMock(return_value=agent3_stream)
 
     # Configure client factory to return agent-specific clients
     def mock_connect_for_error_test(url, *args, **kwargs):
@@ -766,7 +767,7 @@ async def test_pipeline_input_handling(server_state, mock_context, mock_a2a_clie
 
     # Configure a custom stream with longer delays to ensure state transitions are observed
     input_stream = MockStreamResponse(input_request_updates, delay_between_updates=0.1)
-    input_agent_client.send_message_streaming.return_value = input_stream
+    input_agent_client.send_message_streaming = AsyncMock(return_value=input_stream)
 
     # Configure completion mock response for after the input is sent
     input_completion = MockStatus("completed", "Processed input", 1.0)
@@ -777,7 +778,7 @@ async def test_pipeline_input_handling(server_state, mock_context, mock_a2a_clie
     send_input_result.artifacts = [
         MockArtifact("output", [MockPart("text", "Final output after receiving input")])
     ]
-    input_agent_client.send_input.return_value = send_input_result
+    input_agent_client.send_input = AsyncMock(return_value=send_input_result)
 
     # Configure client factory to return our mock client
     def mock_connect(url, *args, **kwargs):
