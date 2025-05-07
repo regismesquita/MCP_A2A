@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 """
-Test runner script that handles all test setup and execution.
+DEPRECATED: This script is deprecated in favor of the improved run_tests.sh script.
 
-Examples:
-    # Run all tests
-    python run_tests.py
-    
-    # Run a specific test file
-    python run_tests.py tests/integration/test_pipeline_execution.py
-    
-    # Run with coverage
-    python run_tests.py --cov=a2a_mcp_server
-    
-This script will automatically:
-1. Check if uv is installed (which provides the uvx command) and install it if needed
-2. Install all test dependencies from pyproject.toml
-3. Run tests with uvx to ensure the correct Python version (3.12.2+)
-4. Pass any arguments to pytest
+The run_tests.sh script now directly creates and uses a virtual environment,
+which is a more reliable approach than using uvx.
 
-You only need Python installed. This script handles the installation of uv 
-(which provides uvx) if it's not already present, along with all other test setup.
+This script remains for backward compatibility but may be removed in the future.
 """
+
+print("WARNING: This script is deprecated in favor of the improved run_tests.sh script.")
+print("The run_tests.sh script now directly creates and uses a virtual environment.")
+print("Please use ./run_tests.sh instead.")
+sys.exit(1)
 
 import os
 import sys
