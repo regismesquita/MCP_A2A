@@ -3,5 +3,13 @@
 *.mdc
 !/agents/README.md
 !/README.md
+!/pr-review-gemini.md
 # Ensure CLAUDE.md is ignored regardless of other patterns
 /CLAUDE.md
+
+# Python packaging
+a2a_mcp_server.egg-info/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
