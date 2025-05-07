@@ -13,12 +13,13 @@ Examples:
     python run_tests.py --cov=a2a_mcp_server
     
 This script will automatically:
-1. Check if uvx is installed and install it if needed
+1. Check if uv is installed (which provides the uvx command) and install it if needed
 2. Install all test dependencies from pyproject.toml
 3. Run tests with uvx to ensure the correct Python version (3.12.2+)
 4. Pass any arguments to pytest
 
-You only need to install uvx, and this script handles everything else.
+You only need Python installed. This script handles the installation of uv 
+(which provides uvx) if it's not already present, along with all other test setup.
 """
 
 import os
@@ -79,10 +80,10 @@ def run_tests_with_uvx(args):
 
 def main():
     """Main entry point."""
-    # Check for uvx and install if needed
+    # Check for uvx command and install uv package if needed
     if not check_uvx():
-        print("uvx not found. This is required to ensure the correct Python version.")
-        install_uvx()
+        print("uv command (uvx) not found. This is required to ensure the correct Python version for tests.")
+        install_uvx()  # install_uvx installs the 'uv' package
         
         # Check again after installation
         if not check_uvx():
