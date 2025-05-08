@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+a2a_mcp_server/__init__.py
+a2a_mcp_server/__main__.py
+a2a_mcp_server/server.py
+a2a_mcp_server.egg-info/PKG-INFO
+a2a_mcp_server.egg-info/SOURCES.txt
+a2a_mcp_server.egg-info/dependency_links.txt
+a2a_mcp_server.egg-info/entry_points.txt
+a2a_mcp_server.egg-info/requires.txt
+a2a_mcp_server.egg-info/top_level.txt

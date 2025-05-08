@@ -1,0 +1,32 @@
+{
+  "name": "Agent2: Finalizer",
+  "description": "Second agent in chain that finalizes processing and produces output",
+  "url": "http://localhost:8002",
+  "provider": {
+    "name": "MCP_A2A Demo",
+    "organization": "MCP_A2A Demo Organization",
+    "url": "https://example.com"
+  },
+  "version": "1.0.0",
+  "documentationUrl": "https://example.com/docs/agent2",
+  "capabilities": {
+    "streaming": true,
+    "stateTransitionHistory": true
+  },
+  "authentication": {
+    "type": "none",
+    "schemes": ["none"]
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "finalize_data",
+      "name": "finalize_data",
+      "description": "Process intermediate results to produce final output",
+      "inputModes": ["text"],
+      "outputModes": ["text"],
+      "tags": ["processing", "chain"]
+    }
+  ]
+}

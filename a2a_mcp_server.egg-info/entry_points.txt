@@ -1,0 +1,2 @@
+[console_scripts]
+a2a-mcp-server = a2a_mcp_server.server:main_cli

@@ -1,0 +1,32 @@
+{
+  "name": "Agent1: Processor",
+  "description": "First agent in chain that processes input and reports progress",
+  "url": "http://localhost:8001",
+  "provider": {
+    "name": "MCP_A2A Demo",
+    "organization": "MCP_A2A Demo Organization",
+    "url": "https://example.com"
+  },
+  "version": "1.0.0",
+  "documentationUrl": "https://example.com/docs/agent1",
+  "capabilities": {
+    "streaming": true,
+    "stateTransitionHistory": true
+  },
+  "authentication": {
+    "type": "none",
+    "schemes": ["none"]
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "process_data",
+      "name": "process_data",
+      "description": "Process input data with detailed progress updates",
+      "inputModes": ["text"],
+      "outputModes": ["text"],
+      "tags": ["processing", "chain"]
+    }
+  ]
+}

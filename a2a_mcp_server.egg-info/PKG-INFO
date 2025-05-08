@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: a2a_mcp_server
+Version: 0.1.0
+Summary: MCP server for A2A agent registry and communication
+Author: A2A MCP Team
+Requires-Python: >=3.12.2
+Description-Content-Type: text/markdown
+Requires-Dist: fastmcp>=2.0.0
+Requires-Dist: a2a_min
+Provides-Extra: test
+Requires-Dist: pytest>=8.0.0; extra == "test"
+Requires-Dist: pytest-asyncio>=0.23.0; extra == "test"
+Requires-Dist: pytest-mock>=3.10.0; extra == "test"
+Requires-Dist: pytest-timeout>=2.1.0; extra == "test"
+Requires-Dist: pytest-cov>=4.1.0; extra == "test"
+Requires-Dist: respx>=0.20.0; extra == "test"
+
 # A2A MCP Server
 
 A Model Context Protocol (MCP) server that provides Claude Desktop and other MCP clients access to A2A protocol agents with real-time progress visibility.
