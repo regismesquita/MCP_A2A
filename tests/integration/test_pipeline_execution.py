@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
 from typing import Callable, Any, Optional
@@ -924,4 +925,897 @@ async def test_pipeline_input_handling(server_state, mock_context, mock_a2a_clie
         pipeline_status = get_status_value(pipeline_state)
         assert pipeline_status != "input-required", (
             f"Pipeline should no longer be in input-required state, got {pipeline_status}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retry_error_policy(server_state, mock_context, mock_a2a_client, cleanup_tasks):
+    """Test retry error policy in pipeline execution with automatic retries."""
+    # Extract mocks
+    _, mock_client_class = mock_a2a_client
+
+    # Import functions
+    from a2a_mcp_server.server import execute_pipeline
+    # Import from the pipeline package (not the redundant pipeline.py file)
+    from a2a_mcp_server.pipeline import (
+        PipelineExecutionEngine, 
+        NodeStatus, 
+        PipelineStatus, 
+        ErrorPolicy
+    )
+
+    try:
+        server_state.pipeline_engine = PipelineExecutionEngine(server_state)
+    except ImportError:
+        pytest.skip("PipelineExecutionEngine not available")
+
+    # Create a pipeline with retry error policy
+    pipeline_def = {
+        "name": "Retry Policy Pipeline",
+        "nodes": [
+            {"id": "NodeA", "agent_name": "agentA"},
+            {
+                "id": "NodeB", 
+                "agent_name": "agentB",
+                "error_policy": "retry",  # Set retry policy
+                "retry_config": {
+                    "max_attempts": 2,  # Will try up to 3 times total (initial + 2 retries)
+                    "base_delay_seconds": 0.01,  # Small delay for faster tests
+                    "backoff_factor": 1.0  # No exponential backoff for predictable testing
+                },
+                "inputs": {
+                    "data": {"source_node": "NodeA", "source_artifact": "output"}
+                }
+            }
+        ],
+        "final_outputs": ["NodeB"]
+    }
+
+    # Configure registry
+    server_state.registry = {
+        "agentA": "http://agentA-url",
+        "agentB": "http://agentB-url"
+    }
+
+    # Create agent-specific mocks
+    agentA_client = AsyncMock()
+    agentB_client = AsyncMock()
+
+    # Configure success stream for agentA
+    agentA_updates = [
+        MockUpdateObject("working", "Starting agentA", 0.3),
+        MockUpdateObject(
+            "completed",
+            "Success from agentA",
+            1.0,
+            artifacts=[MockArtifact("output", [MockPart("text", "Output from agentA")])]
+        )
+    ]
+    agentA_client.send_message_streaming.return_value = MockStreamResponse(
+        agentA_updates, delay_between_updates=0.02
+    )
+
+    # For agentB, we'll create a response factory that fails on first call,
+    # then succeeds on second call
+    def agentB_response_factory(*args, **kwargs):
+        # Check the current retry count to determine the response
+        if agentB_client.send_message_streaming.call_count == 1:
+            # First call - fail with an exception
+            raise Exception("Simulated failure in agentB (first attempt)")
+        else:
+            # Subsequent calls - return success response
+            success_updates = [
+                MockUpdateObject("working", "Retry attempt working", 0.5),
+                MockUpdateObject(
+                    "completed",
+                    "Successfully completed on retry",
+                    1.0,
+                    artifacts=[MockArtifact("result", [MockPart("text", "Retry result from agentB")])]
+                )
+            ]
+            return MockStreamResponse(success_updates, delay_between_updates=0.02)
+
+    # Set up the side effect factory
+    agentB_client.send_message_streaming.side_effect = agentB_response_factory
+
+    # Configure client factory
+    def mock_connect_for_retry_test(url, *args, **kwargs):
+        if url == "http://agentA-url":
+            return agentA_client
+        elif url == "http://agentB-url":
+            return agentB_client
+        return AsyncMock()  # Default case
+
+    mock_client_class.connect = mock_connect_for_retry_test
+
+    # Mock asyncio.sleep to track delay times
+    sleep_calls = []
+    
+    async def mock_sleep(delay):
+        sleep_calls.append(delay)
+        # Use a smaller actual delay for faster tests
+        await asyncio.sleep(0.01)
+    
+    # Create a state logger for debugging
+    def get_pipeline_state():
+        pipeline_state = server_state.pipelines.get(pipeline_id)
+        if not pipeline_state:
+            return "Pipeline not found"
+            
+        status_info = []
+        status_info.append(f"Pipeline status: {get_status_value(pipeline_state)}")
+        
+        for node_key in ["NodeA", "NodeB"]:
+            if node_key in pipeline_state.nodes:
+                node = pipeline_state.nodes[node_key]
+                node_status = get_status_value(node)
+                retry_attempts = getattr(node, "retry_attempts", 0)
+                status_info.append(f"{node_key} status: {node_status}, retries: {retry_attempts}")
+            else:
+                status_info.append(f"{node_key}: not found")
+                
+        status_info.append(f"AgentA calls: {agentA_client.send_message_streaming.call_count}")
+        status_info.append(f"AgentB calls: {agentB_client.send_message_streaming.call_count}")
+        status_info.append(f"Sleep calls: {sleep_calls}")
+        
+        return ", ".join(status_info)
+
+    # Patch necessary components
+    with (
+        patch("a2a_mcp_server.server.A2aMinClient", mock_client_class),
+        patch("a2a_mcp_server.server.state", server_state),
+        patch("asyncio.sleep", mock_sleep)
+    ):
+        # Execute the pipeline
+        result = await execute_pipeline(
+            pipeline_definition=pipeline_def,
+            input_text="Retry test input",
+            ctx=mock_context
+        )
+
+        # Verify execution started
+        assert result["status"] == "success", "Pipeline execution should start successfully"
+        pipeline_id = result["pipeline_id"]
+        assert pipeline_id is not None, "Pipeline ID should be returned"
+
+        # Wait for NodeA to complete
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state.nodes["NodeA"]) == "completed",
+            timeout_message="NodeA did not complete within timeout",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for NodeB to be called
+        await wait_for_condition(
+            lambda: agentB_client.send_message_streaming.call_count >= 1,
+            timeout_message="NodeB (agentB) was not called",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for NodeB to fail on first attempt and trigger retry
+        await wait_for_condition(
+            lambda: hasattr(pipeline_state.nodes["NodeB"], "retry_attempts") 
+                  and pipeline_state.nodes["NodeB"].retry_attempts >= 1,
+            timeout_message="NodeB did not attempt retry",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for asyncio.sleep to be called for retry delay
+        await wait_for_condition(
+            lambda: len(sleep_calls) >= 1,
+            timeout_message="No sleep calls were made for retry delay",
+            state_logger=get_pipeline_state,
+        )
+
+        # Verify retry delay matches configuration
+        assert sleep_calls[0] == 0.01, f"First retry delay should be 0.01s, got {sleep_calls[0]}s"
+
+        # Wait for NodeB to be called a second time
+        await wait_for_condition(
+            lambda: agentB_client.send_message_streaming.call_count >= 2,
+            timeout_message="NodeB (agentB) was not called a second time for retry",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for pipeline to complete successfully after retry
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "completed",
+            timeout_message="Pipeline did not complete after retry",
+            state_logger=get_pipeline_state,
+        )
+
+        # Verify final states
+        assert get_status_value(pipeline_state.nodes["NodeA"]) == "completed", "NodeA should be completed"
+        assert get_status_value(pipeline_state.nodes["NodeB"]) == "completed", "NodeB should be completed after retry"
+        assert pipeline_state.nodes["NodeB"].retry_attempts == 1, "NodeB should have recorded 1 retry attempt"
+        assert agentB_client.send_message_streaming.call_count == 2, "agentB_client should be called twice (initial + retry)"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retry_exhaustion(server_state, mock_context, mock_a2a_client, cleanup_tasks):
+    """Test retry error policy with exhaustion of max retry attempts."""
+    # Extract mocks
+    _, mock_client_class = mock_a2a_client
+
+    # Import functions
+    from a2a_mcp_server.server import execute_pipeline
+    from a2a_mcp_server.pipeline import (
+        PipelineExecutionEngine, 
+        NodeStatus, 
+        PipelineStatus, 
+        ErrorPolicy
+    )
+
+    try:
+        server_state.pipeline_engine = PipelineExecutionEngine(server_state)
+    except ImportError:
+        pytest.skip("PipelineExecutionEngine not available")
+
+    # Create a pipeline with retry error policy but with a low max_attempts
+    pipeline_def = {
+        "name": "Retry Exhaustion Pipeline",
+        "nodes": [
+            {"id": "NodeA", "agent_name": "agentA"},
+            {
+                "id": "NodeB", 
+                "agent_name": "agentB",
+                "error_policy": "retry",  # Set retry policy
+                "retry_config": {
+                    "max_attempts": 1,  # Will try only once more after initial failure
+                    "base_delay_seconds": 0.01,
+                    "backoff_factor": 1.0
+                },
+                "inputs": {
+                    "data": {"source_node": "NodeA", "source_artifact": "output"}
+                }
+            }
+        ],
+        "final_outputs": ["NodeB"]
+    }
+
+    # Configure registry
+    server_state.registry = {
+        "agentA": "http://agentA-url",
+        "agentB": "http://agentB-url"
+    }
+
+    # Create agent-specific mocks
+    agentA_client = AsyncMock()
+    agentB_client = AsyncMock()
+
+    # Configure success stream for agentA
+    agentA_updates = [
+        MockUpdateObject("working", "Starting agentA", 0.3),
+        MockUpdateObject(
+            "completed",
+            "Success from agentA",
+            1.0,
+            artifacts=[MockArtifact("output", [MockPart("text", "Output from agentA")])]
+        )
+    ]
+    agentA_client.send_message_streaming.return_value = MockStreamResponse(agentA_updates)
+
+    # For agentB, create a side effect that always fails
+    def always_fails(*args, **kwargs):
+        raise Exception(f"Simulated failure in agentB (attempt #{agentB_client.send_message_streaming.call_count})")
+
+    agentB_client.send_message_streaming.side_effect = always_fails
+
+    # Configure client factory
+    def mock_connect_for_retry_test(url, *args, **kwargs):
+        if url == "http://agentA-url":
+            return agentA_client
+        elif url == "http://agentB-url":
+            return agentB_client
+        return AsyncMock()
+
+    mock_client_class.connect = mock_connect_for_retry_test
+
+    # Mock asyncio.sleep to track delays
+    sleep_calls = []
+    
+    async def mock_sleep(delay):
+        sleep_calls.append(delay)
+        # Use a smaller actual delay for faster tests
+        await asyncio.sleep(0.005)
+    
+    # Create a state logger for debugging
+    def get_pipeline_state():
+        pipeline_state = server_state.pipelines.get(pipeline_id)
+        if not pipeline_state:
+            return "Pipeline not found"
+            
+        status_info = []
+        status_info.append(f"Pipeline status: {get_status_value(pipeline_state)}")
+        
+        for node_key in ["NodeA", "NodeB"]:
+            if node_key in pipeline_state.nodes:
+                node = pipeline_state.nodes[node_key]
+                node_status = get_status_value(node)
+                retry_attempts = getattr(node, "retry_attempts", 0)
+                status_info.append(f"{node_key} status: {node_status}, retries: {retry_attempts}")
+            else:
+                status_info.append(f"{node_key}: not found")
+                
+        status_info.append(f"AgentA calls: {agentA_client.send_message_streaming.call_count}")
+        status_info.append(f"AgentB calls: {agentB_client.send_message_streaming.call_count}")
+        status_info.append(f"Sleep calls: {sleep_calls}")
+        
+        return ", ".join(status_info)
+
+    # Patch necessary components
+    with (
+        patch("a2a_mcp_server.server.A2aMinClient", mock_client_class),
+        patch("a2a_mcp_server.server.state", server_state),
+        patch("asyncio.sleep", mock_sleep)
+    ):
+        # Execute the pipeline
+        result = await execute_pipeline(
+            pipeline_definition=pipeline_def,
+            input_text="Retry exhaustion test input",
+            ctx=mock_context
+        )
+
+        # Verify execution started
+        assert result["status"] == "success", "Pipeline execution should start successfully"
+        pipeline_id = result["pipeline_id"]
+        assert pipeline_id is not None, "Pipeline ID should be returned"
+
+        # Wait for NodeA to complete
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state.nodes["NodeA"]) == "completed",
+            timeout_message="NodeA did not complete within timeout",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for NodeB to be called initially
+        await wait_for_condition(
+            lambda: agentB_client.send_message_streaming.call_count >= 1,
+            timeout_message="NodeB (agentB) was not called initially",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for retry to be attempted
+        await wait_for_condition(
+            lambda: agentB_client.send_message_streaming.call_count >= 2,
+            timeout_message="NodeB retry was not attempted",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for NodeB to reach max retries and fail
+        await wait_for_condition(
+            lambda: (hasattr(pipeline_state.nodes["NodeB"], "retry_attempts") and 
+                    pipeline_state.nodes["NodeB"].retry_attempts >= 1 and
+                    get_status_value(pipeline_state.nodes["NodeB"]) == "failed"),
+            timeout_message="NodeB did not reach failed state after max retries",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for pipeline to be marked as failed
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "failed",
+            timeout_message="Pipeline did not reach failed state after retry exhaustion",
+            state_logger=get_pipeline_state,
+        )
+
+        # Verify final states
+        assert get_status_value(pipeline_state.nodes["NodeA"]) == "completed", "NodeA should be completed"
+        assert get_status_value(pipeline_state.nodes["NodeB"]) == "failed", "NodeB should be failed after retry exhaustion"
+        assert pipeline_state.nodes["NodeB"].retry_attempts == 1, "NodeB should have recorded 1 retry attempt"
+        assert agentB_client.send_message_streaming.call_count == 2, "agentB_client should be called twice (initial + retry)"
+        assert mock_context.error.called, "Context error should be called when pipeline fails"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_input_mapping_scenarios(server_state, mock_context, mock_a2a_client, cleanup_tasks):
+    """Test various pipeline input mapping scenarios."""
+    # Extract mocks
+    _, mock_client_class = mock_a2a_client
+
+    # Import functions
+    from a2a_mcp_server.server import execute_pipeline
+    from a2a_mcp_server.pipeline import PipelineExecutionEngine, NodeStatus, PipelineStatus
+
+    try:
+        server_state.pipeline_engine = PipelineExecutionEngine(server_state)
+    except ImportError:
+        pytest.skip("PipelineExecutionEngine not available")
+
+    # SCENARIO 1: Initial Input Test
+    # Define a single-node pipeline
+    single_node_pipeline = {
+        "name": "Initial Input Test Pipeline",
+        "nodes": [
+            {"id": "NodeX", "agent_name": "agentX"}
+        ],
+        "final_outputs": ["NodeX"]
+    }
+
+    # Configure registry
+    server_state.registry = {
+        "agentX": "http://agentX-url",
+        "agentP": "http://agentP-url",
+        "agentQ": "http://agentQ-url",
+        "agentS": "http://agentS-url",
+        "agentT": "http://agentT-url"
+    }
+
+    # Create agent mocks
+    agentX_client = AsyncMock()
+    agentP_client = AsyncMock()
+    agentQ_client = AsyncMock()
+    agentS_client = AsyncMock()
+    agentT_client = AsyncMock()
+
+    # Configure success responses for agents
+    agentX_updates = [
+        MockUpdateObject("working", "Processing initial input", 0.5),
+        MockUpdateObject(
+            "completed",
+            "Successfully processed input",
+            1.0,
+            artifacts=[
+                MockArtifact("result", [MockPart("text", "Processed initial input")])
+            ]
+        )
+    ]
+    agentX_client.send_message_streaming.return_value = MockStreamResponse(agentX_updates)
+
+    # Store all captured inputs for verification
+    captured_inputs = {}
+
+    # Create a custom side effect to capture the exact input for all agents
+    def capture_input(agent_name):
+        def _capture_input(*args, **kwargs):
+            # Capture the input message
+            message = kwargs.get("message")
+            captured_inputs[agent_name] = message
+            
+            # Return appropriate response
+            if agent_name == "agentP":
+                return MockStreamResponse([
+                    MockUpdateObject("working", f"Processing in {agent_name}", 0.5),
+                    MockUpdateObject(
+                        "completed",
+                        f"Completed in {agent_name}",
+                        1.0,
+                        artifacts=[
+                            MockArtifact("art1", [MockPart("text", f"Artifact 1 from {agent_name}")]),
+                            MockArtifact("art2", [MockPart("text", f"Artifact 2 from {agent_name}")])
+                        ]
+                    )
+                ])
+            elif agent_name == "agentS":
+                return MockStreamResponse([
+                    MockUpdateObject("working", f"Processing in {agent_name}", 0.5),
+                    MockUpdateObject(
+                        "completed",
+                        f"Completed in {agent_name}",
+                        1.0,
+                        artifacts=[
+                            # Note: Deliberately NOT including "missing_art" to test missing artifact handling
+                            MockArtifact("present_art", [MockPart("text", f"Present artifact from {agent_name}")])
+                        ]
+                    )
+                ])
+            else:
+                # Default response for other agents
+                return MockStreamResponse([
+                    MockUpdateObject("working", f"Processing in {agent_name}", 0.5),
+                    MockUpdateObject(
+                        "completed",
+                        f"Completed in {agent_name}",
+                        1.0,
+                        artifacts=[
+                            MockArtifact("output", [MockPart("text", f"Output from {agent_name}")])
+                        ]
+                    )
+                ])
+        
+        return _capture_input
+
+    # Configure all agents to capture inputs
+    agentX_client.send_message_streaming.side_effect = capture_input("agentX")
+    agentP_client.send_message_streaming.side_effect = capture_input("agentP")
+    agentQ_client.send_message_streaming.side_effect = capture_input("agentQ")
+    agentS_client.send_message_streaming.side_effect = capture_input("agentS")
+    agentT_client.send_message_streaming.side_effect = capture_input("agentT")
+
+    # Configure client factory
+    def mock_connect_for_input_tests(url, *args, **kwargs):
+        if url == "http://agentX-url":
+            return agentX_client
+        elif url == "http://agentP-url":
+            return agentP_client
+        elif url == "http://agentQ-url":
+            return agentQ_client
+        elif url == "http://agentS-url":
+            return agentS_client
+        elif url == "http://agentT-url":
+            return agentT_client
+        return AsyncMock()
+
+    mock_client_class.connect = mock_connect_for_input_tests
+
+    # Patch A2aMinClient
+    with (
+        patch("a2a_mcp_server.server.A2aMinClient", mock_client_class),
+        patch("a2a_mcp_server.server.state", server_state),
+    ):
+        # Create a state logger to track pipeline progress
+        def get_pipeline_state():
+            if 'pipeline_id' not in locals():
+                return "Pipeline not yet created"
+            
+            pipeline_state = server_state.pipelines.get(pipeline_id)
+            if not pipeline_state:
+                return "Pipeline not found"
+            
+            return f"Pipeline status: {get_status_value(pipeline_state)}"
+
+        # SCENARIO 1: Test string initial input
+        initial_text_input = "test_string"
+        result1 = await execute_pipeline(
+            pipeline_definition=single_node_pipeline,
+            input_text=initial_text_input,
+            ctx=mock_context
+        )
+        
+        # Verify execution started
+        assert result1["status"] == "success"
+        pipeline_id = result1["pipeline_id"]
+        
+        # Wait for pipeline to complete
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "completed",
+            timeout_message="Pipeline (string input) did not complete",
+            state_logger=get_pipeline_state,
+        )
+        
+        # Verify agent received the initial input
+        assert "agentX" in captured_inputs, "agentX should have received input"
+        agent_x_message_text = next(
+            (part.text for part in captured_inputs["agentX"].parts 
+             if hasattr(part, "text")), 
+            None
+        )
+        assert agent_x_message_text and initial_text_input in agent_x_message_text, (
+            f"agentX should have received '{initial_text_input}' in message"
+        )
+        
+        # Clear captured inputs for next test
+        captured_inputs.clear()
+        
+        # SCENARIO 1b: Test dictionary initial input with content field
+        initial_dict_input = {"data": {"content": "test_dict_string", "type": "text"}}
+        result1b = await execute_pipeline(
+            pipeline_definition=single_node_pipeline,
+            initial_input=initial_dict_input,  # Using dictionary input
+            ctx=mock_context
+        )
+        
+        # Verify execution started
+        assert result1b["status"] == "success"
+        pipeline_id = result1b["pipeline_id"]
+        
+        # Wait for pipeline to complete
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "completed",
+            timeout_message="Pipeline (dict input) did not complete",
+            state_logger=get_pipeline_state,
+        )
+        
+        # Verify agent received the initial input's content
+        assert "agentX" in captured_inputs, "agentX should have received input"
+        agent_x_message_text = next(
+            (part.text for part in captured_inputs["agentX"].parts 
+             if hasattr(part, "text")), 
+            None
+        )
+        assert agent_x_message_text and "test_dict_string" in agent_x_message_text, (
+            "agentX should have received 'test_dict_string' in message from dictionary input"
+        )
+        
+        # Clear captured inputs for next test
+        captured_inputs.clear()
+        
+        # SCENARIO 2: Implicit All Outputs - NodeP produces two artifacts, NodeQ gets both
+        two_node_implicit_pipeline = {
+            "name": "Implicit All Outputs Pipeline",
+            "nodes": [
+                {"id": "NodeP", "agent_name": "agentP"},
+                {
+                    "id": "NodeQ", 
+                    "agent_name": "agentQ",
+                    "inputs": {},  # No explicit mapping - should get all artifacts
+                    "depends_on": ["NodeP"]  # Explicit dependency to ensure order
+                }
+            ],
+            "final_outputs": ["NodeQ"]
+        }
+        
+        # Execute the implicit inputs pipeline
+        result2 = await execute_pipeline(
+            pipeline_definition=two_node_implicit_pipeline,
+            input_text="Implicit input test",
+            ctx=mock_context
+        )
+        
+        # Verify execution started
+        assert result2["status"] == "success"
+        pipeline_id = result2["pipeline_id"]
+        
+        # Wait for NodeP to complete
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state.nodes["NodeP"]) == "completed",
+            timeout_message="NodeP did not complete",
+        )
+        
+        # Wait for NodeQ to be called after NodeP
+        await wait_for_condition(
+            lambda: "agentQ" in captured_inputs,
+            timeout_message="NodeQ (agentQ) was not called after NodeP",
+        )
+        
+        # Wait for pipeline to complete
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "completed",
+            timeout_message="Pipeline (implicit inputs) did not complete",
+        )
+        
+        # Verify NodeQ received both artifacts from NodeP
+        agent_q_message_text = next(
+            (part.text for part in captured_inputs["agentQ"].parts 
+             if hasattr(part, "text")), 
+            None
+        )
+        assert agent_q_message_text, "agentQ should have received a text message"
+        assert "Artifact 1 from agentP" in agent_q_message_text, (
+            "agentQ should have received 'Artifact 1 from agentP'"
+        )
+        assert "Artifact 2 from agentP" in agent_q_message_text, (
+            "agentQ should have received 'Artifact 2 from agentP'"
+        )
+        
+        # Clear captured inputs for next test
+        captured_inputs.clear()
+        
+        # SCENARIO 3: Explicit Mapping - Artifact Missing
+        missing_artifact_pipeline = {
+            "name": "Missing Artifact Pipeline",
+            "nodes": [
+                {"id": "NodeS", "agent_name": "agentS"},
+                {
+                    "id": "NodeT", 
+                    "agent_name": "agentT",
+                    "inputs": {
+                        "missing_data": {"source_node": "NodeS", "source_artifact": "missing_art"}
+                    }
+                }
+            ],
+            "final_outputs": ["NodeT"]
+        }
+        
+        # Create a log capture to check for warnings about missing artifacts
+        warning_logs = []
+        
+        # Patch logging to capture warnings
+        with patch("logging.warning") as mock_warning:
+            mock_warning.side_effect = lambda msg, *args, **kwargs: warning_logs.append(msg % args if args else msg)
+            
+            # Execute the missing artifact pipeline
+            result3 = await execute_pipeline(
+                pipeline_definition=missing_artifact_pipeline,
+                input_text="Missing artifact test",
+                ctx=mock_context
+            )
+            
+            # Verify execution started
+            assert result3["status"] == "success"
+            pipeline_id = result3["pipeline_id"]
+            
+            # Wait for NodeS to complete
+            pipeline_state = server_state.pipelines[pipeline_id]
+            await wait_for_condition(
+                lambda: get_status_value(pipeline_state.nodes["NodeS"]) == "completed",
+                timeout_message="NodeS did not complete",
+            )
+            
+            # Wait for NodeT to be called
+            await wait_for_condition(
+                lambda: "agentT" in captured_inputs,
+                timeout_message="NodeT (agentT) was not called",
+            )
+            
+            # Check the pipeline state - it may complete or fail depending on NodeT's implementation
+            try:
+                await wait_for_condition(
+                    lambda: get_status_value(pipeline_state) in ["completed", "failed"],
+                    timeout_message="Pipeline did not reach final state",
+                    timeout_seconds=1.0,  # Short timeout as we just want to check final state
+                )
+            except:
+                # It's okay if this times out, we're mainly concerned with the input mapping
+                pass
+            
+            # Verify warning was logged about missing artifact
+            assert any("missing_art" in log for log in warning_logs), (
+                "A warning should be logged about the missing artifact 'missing_art'"
+            )
+            
+            # Verify NodeT received something for the missing artifact input
+            # (could be empty, placeholder, or error message - implementation dependent)
+            agent_t_message_text = next(
+                (part.text for part in captured_inputs["agentT"].parts 
+                 if hasattr(part, "text")), 
+                None
+            )
+            assert agent_t_message_text is not None, "agentT should have received some message"
+            
+            # Verify that the present artifact was NOT implicitly passed through
+            # This is critical for testing explicit mapping behavior - only mapped artifacts should be included
+            assert "Present artifact from agentS" not in agent_t_message_text, (
+                "agentT should NOT have received the present_art artifact that wasn't explicitly mapped"
+            )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_node_execution_robustness(server_state, mock_context, mock_a2a_client, cleanup_tasks):
+    """Test pipeline node execution robustness with error handling and timeouts."""
+    # Extract mocks
+    _, mock_client_class = mock_a2a_client
+
+    # Import functions
+    from a2a_mcp_server.server import execute_pipeline
+    from a2a_mcp_server.pipeline import PipelineExecutionEngine, NodeStatus, PipelineStatus
+
+    try:
+        server_state.pipeline_engine = PipelineExecutionEngine(server_state)
+    except ImportError:
+        pytest.skip("PipelineExecutionEngine not available")
+
+    # Define a simple pipeline for testing unexpected errors
+    error_pipeline = {
+        "name": "Error Handling Pipeline",
+        "nodes": [{"id": "error_node", "agent_name": "error_agent"}],
+        "final_outputs": ["error_node"]
+    }
+
+    # Define a pipeline with timeout for testing timeout handling
+    timeout_pipeline = {
+        "name": "Timeout Handling Pipeline",
+        "nodes": [{
+            "id": "timeout_node", 
+            "agent_name": "timeout_agent",
+            "timeout": 0.1  # Very short timeout for testing
+        }],
+        "final_outputs": ["timeout_node"]
+    }
+
+    # Configure registry
+    server_state.registry = {
+        "error_agent": "http://error-agent-url",
+        "timeout_agent": "http://timeout-agent-url"
+    }
+
+    # Create agent mocks
+    error_agent_client = AsyncMock()
+    timeout_agent_client = AsyncMock()
+
+    # Configure error agent to raise an unexpected ValueError
+    error_agent_client.send_message_streaming.side_effect = ValueError("Unexpected error in agent")
+
+    # Configure timeout agent to sleep longer than its timeout
+    async def timeout_response(*args, **kwargs):
+        # Sleep for longer than the node's timeout
+        await asyncio.sleep(0.5)
+        # This should never be reached in the test
+        return MockStreamResponse([
+            MockUpdateObject("completed", "This should timeout before completing", 1.0)
+        ])
+    
+    timeout_agent_client.send_message_streaming.side_effect = timeout_response
+
+    # Configure client factory
+    def mock_connect_for_robustness_test(url, *args, **kwargs):
+        if url == "http://error-agent-url":
+            return error_agent_client
+        elif url == "http://timeout-agent-url":
+            return timeout_agent_client
+        return AsyncMock()
+
+    mock_client_class.connect = mock_connect_for_robustness_test
+
+    # Create a state logger for debugging
+    def get_pipeline_state():
+        pipeline_state = server_state.pipelines.get(pipeline_id)
+        if not pipeline_state:
+            return "Pipeline not found"
+            
+        status_info = []
+        status_info.append(f"Pipeline status: {get_status_value(pipeline_state)}")
+        
+        for node_id in pipeline_state.nodes:
+            node = pipeline_state.nodes[node_id]
+            node_status = get_status_value(node)
+            status_info.append(f"{node_id} status: {node_status}")
+                
+        return ", ".join(status_info)
+
+    # Patch necessary components
+    with (
+        patch("a2a_mcp_server.server.A2aMinClient", mock_client_class),
+        patch("a2a_mcp_server.server.state", server_state),
+    ):
+        # PART 1: Test unexpected ValueError handling
+        # Execute the error pipeline
+        result1 = await execute_pipeline(
+            pipeline_definition=error_pipeline,
+            input_text="Error test input",
+            ctx=mock_context
+        )
+
+        # Verify execution started
+        assert result1["status"] == "success", "Pipeline execution should start successfully"
+        pipeline_id = result1["pipeline_id"]
+
+        # Wait for error_node to fail due to ValueError
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state.nodes["error_node"]) == "failed",
+            timeout_message="error_node did not reach failed state as expected",
+            state_logger=get_pipeline_state,
+        )
+
+        # Wait for pipeline to be marked as failed
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "failed",
+            timeout_message="Pipeline did not reach failed state after node error",
+            state_logger=get_pipeline_state,
+        )
+
+        # Verify error was reported to context
+        assert mock_context.error.called, "Context error should be called when pipeline fails"
+        
+        # Reset context for next test
+        mock_context.reset_mock()
+
+        # PART 2: Test timeout handling
+        # Execute the timeout pipeline
+        result2 = await execute_pipeline(
+            pipeline_definition=timeout_pipeline,
+            input_text="Timeout test input",
+            ctx=mock_context
+        )
+
+        # Verify execution started
+        assert result2["status"] == "success", "Pipeline execution should start successfully"
+        pipeline_id = result2["pipeline_id"]
+
+        # Wait for timeout_node to fail due to timeout
+        pipeline_state = server_state.pipelines[pipeline_id]
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state.nodes["timeout_node"]) == "failed",
+            timeout_message="timeout_node did not reach failed state after timeout",
+            state_logger=get_pipeline_state,
+            timeout_seconds=1.0,  # Increase timeout for this check to ensure node has time to timeout
+        )
+
+        # Wait for pipeline to be marked as failed
+        await wait_for_condition(
+            lambda: get_status_value(pipeline_state) == "failed",
+            timeout_message="Pipeline did not reach failed state after node timeout",
+            state_logger=get_pipeline_state,
+        )
+
+        # Verify timeout error was reported to context
+        assert mock_context.error.called, "Context error should be called when pipeline times out"
+        error_msg = mock_context.error.call_args[0][0].lower()
+        assert "timeout" in error_msg or "timed out" in error_msg, (
+            f"Error message should mention timeout, got: {error_msg}"
         )

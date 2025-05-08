@@ -10,8 +10,19 @@ from fastmcp import Context
 
 
 @pytest.mark.asyncio
-async def test_context_progress_reporting(server_state, mock_context):
-    """Test progress reporting through FastMCP Context."""
+@pytest.mark.parametrize(
+    "context_issue",
+    [
+        None,  # No issue - normal behavior
+        "report_progress_none",  # report_progress is None
+        "complete_none",  # complete is None
+        "report_progress_raises",  # report_progress raises Exception
+        "complete_raises",  # complete raises Exception
+        "report_progress_non_callable",  # report_progress is not a callable
+    ],
+)
+async def test_context_progress_reporting(server_state, mock_context, context_issue):
+    """Test progress reporting through FastMCP Context, including robust error handling."""
     # Import function to test
     from a2a_mcp_server.server import call_agent
 
@@ -55,6 +66,21 @@ async def test_context_progress_reporting(server_state, mock_context):
     stream_response.stream_updates = progress_stream
     mock_client.send_message_streaming.return_value = stream_response
 
+    # Use a custom context to track progress updates
+    custom_context = MockContext()
+    
+    # Configure context issues based on test parameters
+    if context_issue == "report_progress_none":
+        custom_context.report_progress = None
+    elif context_issue == "complete_none":
+        custom_context.complete = None
+    elif context_issue == "report_progress_raises":
+        custom_context.report_progress.side_effect = Exception("Simulated report_progress failure")
+    elif context_issue == "complete_raises":
+        custom_context.complete.side_effect = Exception("Simulated complete failure")
+    elif context_issue == "report_progress_non_callable":
+        custom_context.report_progress = 123  # Not a callable
+
     # Patch A2aMinClient
     with (
         patch("a2a_mcp_server.server.A2aMinClient") as mock_client_class,
@@ -62,39 +88,60 @@ async def test_context_progress_reporting(server_state, mock_context):
     ):
         mock_client_class.connect.return_value = mock_client
 
-        # Use a custom context to track progress updates
-        custom_context = MockContext()
-
         # Call the agent
         result = await call_agent(
             agent_name="test-agent", prompt="Test prompt", ctx=custom_context
         )
 
-        # Verify
+        # Verify - should complete without exception even with context issues
         assert result["status"] == "success"
-
-        # Check that progress reports were sent to the context
-        assert custom_context.get_progress_count() >= 3
-
-        # Check that the final progress is complete
-        assert custom_context.get_completion_count() == 1
-
-        # Check that there were no errors
-        assert custom_context.get_error_count() == 0
-
-        # Verify progress values were increasing
-        progress_values = [
-            report["current"] for report in custom_context.progress_reports
-        ]
-        assert all(b >= a for a, b in zip(progress_values, progress_values[1:]))
-
-        # Verify completion message
-        assert "Complete" in custom_context.completions[0]["message"]
+        
+        # Normal behavior checks for normal case
+        if context_issue is None:
+            # Check that progress reports were sent to the context
+            assert custom_context.get_progress_count() >= 3
+            
+            # Check that the final progress is complete
+            assert custom_context.get_completion_count() == 1
+            
+            # Check that there were no errors
+            assert custom_context.get_error_count() == 0
+            
+            # Verify progress values were increasing
+            progress_values = [
+                report["current"] for report in custom_context.progress_reports
+            ]
+            assert all(b >= a for a, b in zip(progress_values, progress_values[1:]))
+            
+            # Verify completion message
+            assert "Complete" in custom_context.completions[0]["message"]
+            
+            # Verify that report_progress was called with a single float argument
+            # representing the progress
+            for call_args in custom_context.report_progress.call_args_list:
+                # Extract args and kwargs
+                args, kwargs = call_args
+                # First argument should be a float
+                assert isinstance(args[0], float), f"Progress should be a float, got {type(args[0])}"
+                assert 0.0 <= args[0] <= 1.0, f"Progress should be between 0.0 and 1.0, got {args[0]}"
+        
+        # For error cases, just verify they didn't crash the execution
+        # We're not testing specific behaviors because that would be too implementation-specific
+        # and would make the tests brittle
 
 
 @pytest.mark.asyncio
-async def test_context_error_reporting(server_state):
-    """Test error reporting through FastMCP Context."""
+@pytest.mark.parametrize(
+    "context_issue",
+    [
+        None,  # No issue - normal behavior
+        "error_none",  # error method is None
+        "error_raises",  # error method raises Exception
+        "error_non_callable",  # error method is not a callable
+    ],
+)
+async def test_context_error_reporting(server_state, context_issue):
+    """Test error reporting through FastMCP Context with robust error handling."""
     # Import function to test
     from a2a_mcp_server.server import call_agent
 
@@ -105,6 +152,17 @@ async def test_context_error_reporting(server_state):
     mock_client = AsyncMock()
     mock_client.send_message_streaming.side_effect = Exception("Simulated agent error")
 
+    # Use a custom context to track error updates
+    custom_context = MockContext()
+    
+    # Configure context issues based on test parameter
+    if context_issue == "error_none":
+        custom_context.error = None
+    elif context_issue == "error_raises":
+        custom_context.error.side_effect = Exception("Simulated error method failure")
+    elif context_issue == "error_non_callable":
+        custom_context.error = 123  # Not a callable
+
     # Patch A2aMinClient
     with (
         patch("a2a_mcp_server.server.A2aMinClient") as mock_client_class,
@@ -112,23 +170,25 @@ async def test_context_error_reporting(server_state):
     ):
         mock_client_class.connect.return_value = mock_client
 
-        # Use a custom context to track error updates
-        custom_context = MockContext()
-
         # Call the agent
         result = await call_agent(
             agent_name="error-agent", prompt="Test prompt", ctx=custom_context
         )
 
-        # Verify
+        # Verify - all cases should complete without exception
         assert result["status"] == "error"
+        
+        # For normal case, verify detailed error reporting
+        if context_issue is None:
+            # Check that error was reported to the context
+            assert custom_context.get_error_count() >= 1
+            
+            # Verify error message
+            assert "error" in custom_context.errors[0]["message"].lower()
+            assert "agent" in custom_context.errors[0]["message"].lower()
 
-        # Check that error was reported to the context
-        assert custom_context.get_error_count() >= 1
 
-        # Verify error message
-        assert "error" in custom_context.errors[0]["message"].lower()
-        assert "agent" in custom_context.errors[0]["message"].lower()
+# This test was replaced by the parametrized version above.
 
 
 @pytest.mark.asyncio
@@ -156,8 +216,16 @@ async def test_tool_registration():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_progress_reporting(server_state):
-    """Test pipeline progress reporting through FastMCP Context."""
+@pytest.mark.parametrize(
+    "context_issue",
+    [
+        None,  # No issue - normal behavior
+        "report_progress_none",  # report_progress is None
+        "complete_none",  # complete is None
+    ],
+)
+async def test_pipeline_progress_reporting(server_state, context_issue):
+    """Test pipeline progress reporting through FastMCP Context with robust error handling."""
     # Import function to test
     from a2a_mcp_server.server import execute_pipeline
 
@@ -246,6 +314,12 @@ async def test_pipeline_progress_reporting(server_state):
 
         # Use a custom context to track progress updates
         custom_context = MockContext()
+        
+        # Configure context issues based on test parameters
+        if context_issue == "report_progress_none":
+            custom_context.report_progress = None
+        elif context_issue == "complete_none":
+            custom_context.complete = None
 
         # Execute the pipeline
         result = await execute_pipeline(
@@ -255,25 +329,39 @@ async def test_pipeline_progress_reporting(server_state):
         )
 
         # Verify execution started
-        assert result["status"] == "success"
+        assert result["status"] == "success", "Pipeline execution should start successfully regardless of context issues"
 
         # Wait for pipeline to complete
         await asyncio.sleep(0.5)  # Give time for all progress updates
 
-        # Check that progress reports were sent
-        assert custom_context.get_progress_count() >= 4  # At least a few updates
+        # For normal case, verify detailed behavior
+        if context_issue is None:
+            # Check that progress reports were sent
+            assert custom_context.get_progress_count() >= 4, "Should have at least 4 progress updates"
 
-        # Check that completion was reported
-        assert custom_context.get_completion_count() >= 1
+            # Check that completion was reported
+            assert custom_context.get_completion_count() >= 1, "Should have at least 1 completion"
 
-        # Check that there were no errors
-        assert custom_context.get_error_count() == 0
+            # Check that there were no errors
+            assert custom_context.get_error_count() == 0, "Should have no errors in normal operation"
 
-        # Verify progress values were generally increasing
-        progress_values = [
-            report["current"] for report in custom_context.progress_reports
-        ]
+            # Verify progress values were generally increasing
+            progress_values = [
+                report["current"] for report in custom_context.progress_reports
+            ]
 
-        # Progress may not be strictly increasing due to the way pipeline progress is calculated
-        # But the final progress should be near 1.0
-        assert progress_values[-1] > 0.9
+            # Progress may not be strictly increasing due to the way pipeline progress is calculated
+            # But the final progress should be near 1.0
+            assert progress_values[-1] > 0.9, "Final progress should be near 1.0"
+            
+            # Verify that report_progress was called with a single float argument
+            # representing the overall progress
+            for call_args in custom_context.report_progress.call_args_list:
+                # Extract args 
+                args, kwargs = call_args
+                # First argument should be a float progress value
+                assert isinstance(args[0], float), f"Progress should be a float, got {type(args[0])}"
+                assert 0.0 <= args[0] <= 1.0, f"Progress should be between 0.0 and 1.0, got {args[0]}"
+        
+        # For error cases, just verify they didn't crash the execution
+        # We're only testing that the code handles these errors gracefully

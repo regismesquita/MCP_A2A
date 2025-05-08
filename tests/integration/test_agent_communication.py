@@ -10,8 +10,21 @@ from tests.fixtures.mock_context import MockContext
 
 
 @pytest.mark.asyncio
-async def test_agent_communication(server_state, mock_context, mock_a2a_client):
-    """Test complete communication cycle with an agent."""
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        None,  # No error - normal case
+        "invalid_message_type",  # update.status.message is an integer instead of string
+        "missing_progress",  # update.status.progress is missing
+        "invalid_progress_type",  # update.status.progress is a string instead of float
+        "stream_updates_not_generator",  # stream_updates is not an async generator
+        "stream_updates_none",  # stream_updates is None
+        "report_progress_none",  # mock_context.report_progress is None
+        "complete_raises_exception",  # mock_context.complete raises Exception
+    ],
+)
+async def test_agent_communication(server_state, mock_context, mock_a2a_client, error_type):
+    """Test complete communication cycle with an agent, including error handling."""
     # Extract mocks
     mock_client, mock_client_class = mock_a2a_client
 
@@ -23,6 +36,103 @@ async def test_agent_communication(server_state, mock_context, mock_a2a_client):
 
     # Setup client created by connect() to be our mock_client
     client_for_url = {}
+    
+    # Create a customized mock client based on the error type parameter
+    if error_type == "invalid_message_type":
+        # Create a stream with invalid message type
+        invalid_updates = [
+            # First update with integer message (invalid type)
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "working", "message": 123, "progress": 0.5}),
+                    "artifacts": []
+                }
+            ),
+            # Second update with proper message to allow the test to complete
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "completed", "message": "Completed", "progress": 1.0}),
+                    "artifacts": []
+                }
+            ),
+        ]
+        # Create an async iterator for the stream
+        class CustomMockStreamResponse(MockStreamResponse):
+            def __init__(self, *args, **kwargs):
+                super().__init__(updates=invalid_updates, delay_between_updates=0.01)
+                
+        mock_client.send_message_streaming.return_value = CustomMockStreamResponse()
+        
+    elif error_type == "missing_progress":
+        # Create a stream with missing progress attribute
+        missing_progress_updates = [
+            # Update with missing progress
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "working", "message": "Working"}),  # No progress
+                    "artifacts": []
+                }
+            ),
+            # Second update with proper attributes to complete
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "completed", "message": "Completed", "progress": 1.0}),
+                    "artifacts": []
+                }
+            ),
+        ]
+        mock_client.send_message_streaming.return_value = MockStreamResponse(missing_progress_updates)
+        
+    elif error_type == "invalid_progress_type":
+        # Create a stream with invalid progress type
+        invalid_progress_updates = [
+            # Update with string progress (invalid type)
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "working", "message": "Working", "progress": "50%"}),
+                    "artifacts": []
+                }
+            ),
+            # Second update with proper attributes
+            type(
+                "UpdateObject", 
+                (), 
+                {
+                    "status": type("Status", (), {"state": "completed", "message": "Completed", "progress": 1.0}),
+                    "artifacts": []
+                }
+            ),
+        ]
+        mock_client.send_message_streaming.return_value = MockStreamResponse(invalid_progress_updates)
+        
+    elif error_type == "stream_updates_not_generator":
+        # Create a response where stream_updates is not an async generator
+        class BadStreamResponse:
+            def stream_updates(self):
+                # Return a regular function instead of an async generator
+                return lambda: None
+                
+        mock_client.send_message_streaming.return_value = BadStreamResponse()
+        
+    elif error_type == "stream_updates_none":
+        # Create a response where stream_updates is None
+        class NoneStreamResponse:
+            def __init__(self):
+                self.stream_updates = None
+                
+        mock_client.send_message_streaming.return_value = NoneStreamResponse()
+    
+    # Use the unmodified mock client for other cases
     client_for_url["http://agent-url"] = mock_client
 
     def mock_connect_with_url_lookup(url, *args, **kwargs):
@@ -32,6 +142,12 @@ async def test_agent_communication(server_state, mock_context, mock_a2a_client):
 
     # Configure the mock factory to return our predefined client
     mock_client_class.connect = mock_connect_with_url_lookup
+
+    # Configure context issues if requested
+    if error_type == "report_progress_none":
+        mock_context.report_progress = None
+    elif error_type == "complete_raises_exception":
+        mock_context.complete.side_effect = Exception("Simulated complete failure")
 
     # Patch server state and A2aMinClient
     with (
@@ -43,35 +159,120 @@ async def test_agent_communication(server_state, mock_context, mock_a2a_client):
             agent_name="test-agent", prompt="Test prompt", ctx=mock_context
         )
 
-        # Verify
-        assert result["status"] == "success"
-        assert mock_context.report_progress.call_count >= 2
-        # The implementation might use either streaming or non-streaming call
-        assert mock_client.send_message_streaming.called or mock_client.send_message.called
+        # Verify - normal case should succeed, error cases should handle gracefully
+        if error_type is None:
+            assert result["status"] == "success"
+            assert mock_context.report_progress.call_count >= 2
+            assert mock_client.send_message_streaming.called
+            
+            # Find the request_id from the result
+            request_id = result.get("request_id")
+            assert request_id is not None
 
-        # Find the request_id from the result
-        request_id = result.get("request_id")
-        assert request_id is not None
+            # Explicitly complete the request
+            await server_state.complete_request(
+                request_id=request_id,
+                status="completed",
+                message="Test completed",
+                ctx=mock_context,
+            )
 
-        # Explicitly complete the request (in real code this would happen via the client disconnect or completion)
-        await server_state.complete_request(
-            request_id=request_id,
-            status="completed",
-            message="Test completed",
+            # Check request tracking
+            assert len(server_state.active_requests) == 0  # Request should be completed and removed
+            assert len(server_state.execution_logs) >= 1
+            assert request_id in server_state.execution_logs
+
+            # Verify log entries
+            logs = server_state.execution_logs[request_id]
+            assert len(logs) >= 2
+            assert any(log["status"] == "completed" for log in logs)
+        else:
+            # In error cases, behavior should be graceful rather than crashing
+            # Make more specific assertions based on the error type
+            assert result is not None
+            
+            if error_type in ["invalid_message_type", "missing_progress", "invalid_progress_type"]:
+                # For malformed agent responses, we expect explicit error status
+                assert "status" in result
+                assert result["status"] == "error" or result["status"] == "partial_success"
+                # Check that message mentions the issue
+                if "message" in result:
+                    assert "invalid" in result["message"].lower() or "missing" in result["message"].lower()
+            
+            elif error_type in ["stream_updates_not_generator", "stream_updates_none"]:
+                # For stream-related errors, check for error status and appropriate error tracking
+                assert "status" in result
+                assert result["status"] == "error"
+                # For stream issues, we'd expect fallback to non-streaming mode or complete failure
+                if "message" in result:
+                    assert "stream" in result["message"].lower() or "failed" in result["message"].lower()
+            
+            elif error_type == "report_progress_none":
+                # For context method issues, the error recovery path should still execute
+                # This may or may not affect the result status depending on implementation
+                assert "status" in result
+                # The main goal is no crash, but we should have attempted error handling
+                assert mock_context.error.called
+                
+            elif error_type == "complete_raises_exception":
+                # For context.complete raising an exception, we should have attempted error handling
+                assert mock_context.error.called
+                # The original operation may have succeeded before the completion failed
+                if result["status"] == "success":
+                    # Check that we attempted to report the exception
+                    assert any("exception" in str(call).lower() for call in mock_context.error.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_call_agent_forced_non_streaming(server_state, mock_context, mock_a2a_client):
+    """Test calling agent with force_non_streaming parameter."""
+    # Extract mocks
+    mock_client, mock_client_class = mock_a2a_client
+
+    # Import function to test
+    from a2a_mcp_server.server import call_agent
+
+    # Configure registry
+    server_state.registry = {"test-agent": "http://agent-url"}
+
+    # Setup client created by connect() to be our mock_client
+    client_for_url = {"http://agent-url": mock_client}
+    mock_client_class.connect = lambda url, *args, **kwargs: client_for_url.get(url, AsyncMock())
+
+    # Patch server state and A2aMinClient
+    with (
+        patch("a2a_mcp_server.server.state", server_state),
+        patch("a2a_mcp_server.server.A2aMinClient", mock_client_class),
+    ):
+        # Call the agent with force_non_streaming=True
+        result_non_streaming = await call_agent(
+            agent_name="test-agent", 
+            prompt="Test prompt", 
             ctx=mock_context,
+            force_non_streaming=True
         )
 
-        # Check request tracking
-        assert (
-            len(server_state.active_requests) == 0
-        )  # Request should be completed and removed
-        assert len(server_state.execution_logs) >= 1
-        assert request_id in server_state.execution_logs
-
-        # Verify log entries
-        logs = server_state.execution_logs[request_id]
-        assert len(logs) >= 2
-        assert any(log["status"] == "completed" for log in logs)
+        # Verify non-streaming behavior
+        assert result_non_streaming["status"] == "success"
+        assert mock_client.send_message.called
+        assert not mock_client.send_message_streaming.called
+        
+        # Reset the mocks
+        mock_client.send_message.reset_mock()
+        mock_client.send_message_streaming.reset_mock()
+        
+        # Call the agent with force_non_streaming=False (default)
+        result_streaming = await call_agent(
+            agent_name="test-agent", 
+            prompt="Test prompt", 
+            ctx=mock_context,
+            force_non_streaming=False
+        )
+        
+        # Verify streaming behavior
+        assert result_streaming["status"] == "success"
+        assert mock_client.send_message_streaming.called
+        assert not mock_client.send_message.called
 
 
 @pytest.mark.asyncio
