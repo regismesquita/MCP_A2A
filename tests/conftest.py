@@ -82,12 +82,18 @@ def throttler():
 
 @pytest.fixture
 def mock_context():
-    """Create a mock FastMCP Context for progress reporting."""
-    context = AsyncMock(spec=Context)
-    context.report_progress = AsyncMock()
-    context.complete = AsyncMock()
-    context.error = AsyncMock()
-    return context
+    """Create a mock FastMCP Context for progress reporting.
+    
+    The default implementation uses AsyncMock, but for more robust testing,
+    consider using the MockContext class from fixtures.mock_context which
+    provides better tracking and configurable failure modes.
+    """
+    # Import the enhanced MockContext
+    from tests.fixtures.mock_context import MockContext
+    
+    # Create and return the enhanced MockContext instance
+    # This provides better tracking and configurable failure modes
+    return MockContext()
 
 
 @pytest.fixture
@@ -152,12 +158,30 @@ class MockArtifact:
 
 
 class MockUpdateObject:
-    """Mock for update object returned in a2a_min streaming response."""
+    """Mock for update object returned in a2a_min streaming response.
+    
+    Enhanced to support testing with invalid types for message and progress:
+    - status_message can be a string or any other type (for robustness testing)
+    - status_progress can be a float or any other type (for robustness testing)
+    - status_progress can be omitted entirely by setting omit_progress=True
+    """
 
     def __init__(
-        self, status_state, status_message="", status_progress=0.0, artifacts=None
+        self, status_state, status_message="", status_progress=0.0, artifacts=None,
+        omit_progress=False
     ):
-        self.status = MockStatus(status_state, status_message, status_progress)
+        # Create a status object with potentially invalid types for testing robustness
+        if omit_progress:
+            # Creates a status without the progress attribute
+            self.status = type(
+                "Status", 
+                (), 
+                {"state": status_state, "message": status_message, "value": status_state}
+            )
+        else:
+            # Normal status with all attributes
+            self.status = MockStatus(status_state, status_message, status_progress)
+        
         self.artifacts = artifacts or []
 
 
@@ -200,15 +224,25 @@ class MockStreamResponse:
         stream_updates = await streaming_task.stream_updates()
         async for update in stream_updates:
             # Process updates
+            
+    Enhanced with configurable failure modes for robust testing:
+    - stream_updates can be set to None
+    - stream_updates can be made to return a non-async-generator
+    - stream_updates can be a different type entirely
     """
 
-    def __init__(self, updates=None, delay_between_updates=0.01):
+    def __init__(self, updates=None, delay_between_updates=0.01, stream_updates_mode="normal"):
         """Create a mock stream response with the specified updates.
 
         Args:
             updates: List of MockUpdateObject instances. If None, default updates are used.
             delay_between_updates: Delay in seconds between yielding updates. Useful for
                 simulating realistic network and processing delays.
+            stream_updates_mode: Mode for configuring stream_updates method:
+                - "normal": Returns a proper async iterator (default)
+                - "none": Sets stream_updates to None
+                - "not_async_gen": Makes stream_updates return a regular function
+                - "function": Makes stream_updates a regular function instead of a method
                 
         If no updates provided, uses a default set of updates that go from
         working to completed with a result artifact.
@@ -234,13 +268,28 @@ class MockStreamResponse:
             self.updates = updates
             
         self.delay_between_updates = delay_between_updates
+        
+        # Configure stream_updates based on mode
+        if stream_updates_mode == "normal":
+            # Normal behavior - stream_updates returns an async iterator
+            self.stream_updates = self._normal_stream_updates
+        elif stream_updates_mode == "none":
+            # Set stream_updates to None for testing robustness
+            self.stream_updates = None
+        elif stream_updates_mode == "not_async_gen":
+            # Make stream_updates return a regular function instead of an async generator
+            self.stream_updates = self._not_async_gen_stream_updates
+        elif stream_updates_mode == "function":
+            # Replace stream_updates with a regular function
+            self.stream_updates = lambda: None
 
-    def stream_updates(self):
-        """Return an async iterator of updates.
-
-        This method now directly returns an async iterator.
-        """
+    def _normal_stream_updates(self):
+        """Return an async iterator of updates (normal behavior)."""
         return StreamUpdateAsyncIterator(self.updates, self.delay_between_updates)
+    
+    def _not_async_gen_stream_updates(self):
+        """Return a regular function instead of an async generator."""
+        return lambda: None
 
 
 @pytest.fixture

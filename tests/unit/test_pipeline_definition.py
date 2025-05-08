@@ -36,23 +36,159 @@ def test_pipeline_definition_validation(valid_pipeline_def):
         PipelineDefinition(create_invalid_pipeline())
 
 
-def test_get_execution_order():
-    """Test getting execution order based on dependencies."""
-    # Skip the simple pipeline test that's failing due to implementation differences
-    # and focus on testing the dependency-based ordering logic
+@pytest.mark.parametrize(
+    "pipeline_structure,expected_order",
+    [
+        # Simple linear pipeline: A -> B -> C
+        (
+            {
+                "name": "Linear Pipeline",
+                "nodes": [
+                    {"id": "A", "agent_name": "agent1"},
+                    {
+                        "id": "B", 
+                        "agent_name": "agent2",
+                        "inputs": {"data": {"source_node": "A", "source_artifact": "output"}}
+                    },
+                    {
+                        "id": "C", 
+                        "agent_name": "agent3",
+                        "inputs": {"data": {"source_node": "B", "source_artifact": "output"}}
+                    }
+                ],
+                "final_outputs": ["C"]
+            },
+            ["A", "B", "C"]
+        ),
+        # Branching: A -> B, A -> C (B, C are alphabetically ordered at same level)
+        (
+            {
+                "name": "Branching Pipeline",
+                "nodes": [
+                    {"id": "A", "agent_name": "agent1"},
+                    {
+                        "id": "B", 
+                        "agent_name": "agent2",
+                        "inputs": {"data": {"source_node": "A", "source_artifact": "output"}}
+                    },
+                    {
+                        "id": "C", 
+                        "agent_name": "agent3",
+                        "inputs": {"data": {"source_node": "A", "source_artifact": "output"}}
+                    }
+                ],
+                "final_outputs": ["B", "C"]
+            },
+            ["A", "B", "C"]  # B, C in alphabetical order at same level
+        ),
+        # Converging: A -> C, B -> C
+        (
+            {
+                "name": "Converging Pipeline",
+                "nodes": [
+                    {"id": "A", "agent_name": "agent1"},
+                    {"id": "B", "agent_name": "agent2"},
+                    {
+                        "id": "C", 
+                        "agent_name": "agent3",
+                        "inputs": {
+                            "data1": {"source_node": "A", "source_artifact": "output"},
+                            "data2": {"source_node": "B", "source_artifact": "output"}
+                        }
+                    }
+                ],
+                "final_outputs": ["C"]
+            },
+            ["A", "B", "C"]  # A, B in alphabetical order at same level
+        ),
+        # Mixed: A -> B, B -> C, B -> D, C -> E, D -> E
+        (
+            {
+                "name": "Mixed Pipeline",
+                "nodes": [
+                    {"id": "A", "agent_name": "agent1"},
+                    {
+                        "id": "B",
+                        "agent_name": "agent2",
+                        "inputs": {"data": {"source_node": "A", "source_artifact": "output"}}
+                    },
+                    {
+                        "id": "C",
+                        "agent_name": "agent3",
+                        "inputs": {"data": {"source_node": "B", "source_artifact": "output"}}
+                    },
+                    {
+                        "id": "D",
+                        "agent_name": "agent4",
+                        "inputs": {"data": {"source_node": "B", "source_artifact": "output"}}
+                    },
+                    {
+                        "id": "E",
+                        "agent_name": "agent5",
+                        "inputs": {
+                            "data1": {"source_node": "C", "source_artifact": "output"},
+                            "data2": {"source_node": "D", "source_artifact": "output"}
+                        }
+                    }
+                ],
+                "final_outputs": ["E"]
+            },
+            ["A", "B", "C", "D", "E"]  # C, D in alphabetical order at same level
+        ),
+        # Pipeline with no dependencies (nodes X, Y, Z)
+        (
+            {
+                "name": "No Dependencies Pipeline",
+                "nodes": [
+                    {"id": "X", "agent_name": "agent1"},
+                    {"id": "Y", "agent_name": "agent2"},
+                    {"id": "Z", "agent_name": "agent3"}
+                ],
+                "final_outputs": ["X", "Y", "Z"]
+            },
+            ["X", "Y", "Z"]  # X, Y, Z in alphabetical order (no dependencies)
+        )
+    ]
+)
+def test_get_execution_order(pipeline_structure, expected_order):
+    """Test getting execution order based on dependencies with various pipeline structures."""
+    # Create pipeline from the test case
+    pipeline = PipelineDefinition(pipeline_structure)
     
+    # Get execution order
+    execution_order = pipeline.get_execution_order()
+    
+    # Verify execution order matches expected
+    assert execution_order == expected_order, f"Expected {expected_order}, got {execution_order}"
+    
+    # Additionally verify dependencies are correctly identified for each node
+    for i, node_id in enumerate(execution_order):
+        node_deps = pipeline.get_dependencies(node_id)
+        
+        # Check each node's dependencies are before it in the execution order
+        for dep in node_deps:
+            assert execution_order.index(dep) < i, f"Dependency {dep} of {node_id} should come before it in execution order"
+
+
+def test_execution_order_complex_pipeline():
+    """Test execution order with the complex pipeline template."""
     # Test with complex pipeline
     complex_def = create_complex_pipeline()
     complex_pipeline = PipelineDefinition(complex_def)
     execution_order = complex_pipeline.get_execution_order()
-    print(f"Original execution order: {execution_order}")
     
     # Check all nodes are in the execution order
     for node_id in ["source", "preprocess", "analyze", "visualize", "report"]:
         assert node_id in execution_order
     
-    # Check a few known dependencies - don't test the entire order
-    # This verifies functionality without being too brittle
+    # Check dependency relationships are preserved in execution order
+    # These dependency assertions verify the topological sort
+    assert execution_order.index("source") < execution_order.index("preprocess")
+    assert execution_order.index("preprocess") < execution_order.index("analyze")
+    assert execution_order.index("analyze") < execution_order.index("report")
+    assert execution_order.index("visualize") < execution_order.index("report")
+    
+    # Verify all dependencies are correctly identified
     deps = complex_pipeline.get_dependencies("report")
     assert "analyze" in deps
     assert "visualize" in deps
@@ -173,16 +309,18 @@ def test_validate_schema():
 
     # Invalid - missing nodes
     invalid_def = {"name": "Invalid Pipeline", "final_outputs": ["node1"]}
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         PipelineDefinition(invalid_def)
+    assert "nodes" in str(excinfo.value).lower(), "Error should mention missing 'nodes' field"
 
     # Invalid - missing name
     invalid_def = {
         "nodes": [{"id": "node1", "agent_name": "agent1"}],
         "final_outputs": ["node1"],
     }
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         PipelineDefinition(invalid_def)
+    assert "name" in str(excinfo.value).lower(), "Error should mention missing 'name' field"
 
     # In the new implementation, final_outputs is not required
     # So we'll skip this test
@@ -202,8 +340,9 @@ def test_validate_schema():
         "nodes": [{"agent_name": "agent1"}],
         "final_outputs": ["node1"],
     }
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         PipelineDefinition(invalid_def)
+    assert "id" in str(excinfo.value).lower(), "Error should mention missing 'id' field"
 
     # Invalid - node missing agent_name
     invalid_def = {
@@ -211,8 +350,24 @@ def test_validate_schema():
         "nodes": [{"id": "node1"}],
         "final_outputs": ["node1"],
     }
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         PipelineDefinition(invalid_def)
+    assert "agent_name" in str(excinfo.value).lower(), "Error should mention missing 'agent_name' field"
+    
+    # Invalid - specific test for node with missing agent_name in a list of valid nodes
+    invalid_def = {
+        "name": "Invalid Pipeline with Missing agent_name",
+        "nodes": [
+            {"id": "node1", "agent_name": "agent1"},  # Valid node
+            {"id": "node2"},  # Missing agent_name
+            {"id": "node3", "agent_name": "agent3"},  # Valid node
+        ],
+        "final_outputs": ["node3"],
+    }
+    with pytest.raises(Exception) as excinfo:
+        PipelineDefinition(invalid_def)
+    assert "agent_name" in str(excinfo.value).lower(), "Error should mention missing 'agent_name' field"
+    assert "node2" in str(excinfo.value), "Error should mention the problematic node 'node2'"
 
 
 def test_final_outputs_validation():
