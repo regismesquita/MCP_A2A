@@ -51,7 +51,8 @@ async def test_context_progress_reporting(server_state, mock_context):
             )
             await asyncio.sleep(0.01)  # Small delay to simulate real timing
 
-    stream_response.stream_updates.return_value = progress_stream()
+    # stream_updates should be a synchronous method that returns an async generator
+    stream_response.stream_updates = progress_stream
     mock_client.send_message_streaming.return_value = stream_response
 
     # Patch A2aMinClient
@@ -230,7 +231,8 @@ async def test_pipeline_progress_reporting(server_state):
                 )
                 await asyncio.sleep(0.01)
 
-        mock_stream.stream_updates.return_value = stream_updates()
+        # stream_updates should be a synchronous method that returns an async generator
+        mock_stream.stream_updates = stream_updates
         return mock_stream
 
     mock_client.send_message_streaming.side_effect = progress_stream

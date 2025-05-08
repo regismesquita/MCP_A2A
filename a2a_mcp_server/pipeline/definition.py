@@ -242,8 +242,8 @@ class PipelineDefinition:
             if node_id not in visited:
                 visit(node_id)
 
-        # Reverse to get correct execution order
-        result = list(reversed(order))
+        # Do NOT reverse the order - we want dependencies to run first
+        result = order
 
         # Rearrange for test expectations if needed
         # This is a bit of a hack to make the tests pass,
@@ -374,6 +374,16 @@ class PipelineDefinition:
             Ordered list of node IDs
         """
         return self._get_execution_order(self.definition)
+        
+    def build_execution_order(self) -> List[str]:
+        """
+        Build and return the execution order for nodes based on dependencies.
+        This is an alias for get_execution_order() to maintain compatibility with PipelineState.
+
+        Returns:
+            Ordered list of node IDs
+        """
+        return self.get_execution_order()
 
     def get_dependencies(self, node_id: str) -> Set[str]:
         """

@@ -1,0 +1,41 @@
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:145 - Initializing server 'A2A MCP Server'
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:384 - Registering handler for ListToolsRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:406 - Registering handler for CallToolRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:252 - Registering handler for ListResourcesRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:286 - Registering handler for ReadResourceRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:222 - Registering handler for PromptListRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:239 - Registering handler for GetPromptRequest
+2025-05-08 14:14:58,906 [DEBUG] mcp.server.lowlevel.server:267 - Registering handler for ListResourceTemplatesRequest
+[05/08/25 14:14:58] INFO     Starting server "A2A MCP Server"...   server.py:298
+2025-05-08 14:14:58,913 [INFO] FastMCP.fastmcp.server.server:298 - Starting server "A2A MCP Server"...
+2025-05-08 14:14:58,916 [DEBUG] asyncio:64 - Using selector: KqueueSelector
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/nicobailon/Documents/development/MCP_A2A/a2a_mcp_server/__main__.py", line 10, in <module>
+    main_cli()
+    ~~~~~~~~^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/a2a_mcp_server/server.py", line 3163, in main_cli
+    mcp_instance.run(transport=args.transport)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/.venv/lib/python3.13/site-packages/fastmcp/server/server.py", line 300, in run
+    anyio.run(partial(self.run_async, transport, **transport_kwargs))
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/.venv/lib/python3.13/site-packages/anyio/_core/_eventloop.py", line 74, in run
+    return async_backend.run(func, args, {}, backend_options)
+           ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/.venv/lib/python3.13/site-packages/anyio/_backends/_asyncio.py", line 2310, in run
+    return runner.run(wrapper())
+           ~~~~~~~~~~^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/.venv/lib/python3.13/site-packages/anyio/_backends/_asyncio.py", line 2298, in wrapper
+    return await func(*args)
+           ^^^^^^^^^^^^^^^^^
+  File "/Users/nicobailon/Documents/development/MCP_A2A/.venv/lib/python3.13/site-packages/fastmcp/server/server.py", line 283, in run_async
+    raise ValueError(f"Unknown transport: {transport}")
+ValueError: Unknown transport: http

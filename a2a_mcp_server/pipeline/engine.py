@@ -19,6 +19,11 @@ from fastmcp import Context
 # For type hinting ServerState to avoid circular import at module level
 if TYPE_CHECKING:
     from a2a_mcp_server.server import ServerState
+else:
+    pass  # No runtime import needed
+
+# Import safe_context_call from utils to avoid circular dependency
+from a2a_mcp_server.utils.context import safe_context_call
 
 logger = logging.getLogger(__name__)
 
@@ -444,31 +449,35 @@ class NodeExecutionContext:
         self.node_id = node_id
         self.parent_ctx = parent_ctx
 
-    async def report_progress(self, current: float, total: float, message: str) -> None:
+    async def report_progress(self, progress_value: float) -> None:
         """
         Report node progress and update pipeline progress.
 
         Args:
-            current: Current progress value
-            total: Total progress value
-            message: Progress message
+            progress_value: Progress value (0.0 to 1.0)
         """
         # Update node state
         node = self.pipeline_state.nodes[self.node_id]
-        node.progress = current / total if total > 0 else 0
-        node.message = message
+        node.progress = progress_value
+        # We no longer receive a message parameter
         node.status = NodeStatus.WORKING
 
         # Update pipeline state
         self.pipeline_state.update_status()
         self.pipeline_state.update_progress()
 
-        # Report progress to parent context
-        await self.parent_ctx.report_progress(
-            current=self.pipeline_state.progress,
-            total=1.0,
-            message=self.pipeline_state.message,
-        )
+        # Report progress to parent context with error handling
+        try:
+            # Try report_progress with defensive programming
+            if hasattr(self.parent_ctx, "report_progress") and callable(self.parent_ctx.report_progress):
+                await self.parent_ctx.report_progress(
+                    self.pipeline_state.progress
+                )
+            else:
+                logger.warning(f"Parent context has no report_progress method in NodeExecutionContext.report_progress")
+        except Exception as e:
+            logger.warning(f"Error in NodeExecutionContext.report_progress: {str(e)}")
+            # No further fallback needed
 
     async def complete(self, message: str) -> None:
         """
@@ -488,12 +497,15 @@ class NodeExecutionContext:
         self.pipeline_state.update_status()
         self.pipeline_state.update_progress()
 
-        # Report progress to parent context
-        await self.parent_ctx.report_progress(
-            current=self.pipeline_state.progress,
-            total=1.0,
-            message=self.pipeline_state.message,
-        )
+        # Report progress to parent context using safe_context_call
+        try:
+            # First try normal report_progress
+            await self.parent_ctx.report_progress(
+                self.pipeline_state.progress
+            )
+        except Exception as e:
+            logger.warning(f"Error in NodeExecutionContext.complete when calling report_progress: {str(e)}")
+            # We don't need another fallback here since this is itself a fallback
 
     async def error(self, message: str) -> None:
         """
@@ -513,12 +525,19 @@ class NodeExecutionContext:
         self.pipeline_state.update_status()
         self.pipeline_state.update_progress()
 
-        # Report progress to parent context
-        await self.parent_ctx.report_progress(
-            current=self.pipeline_state.progress,
-            total=1.0,
-            message=self.pipeline_state.message,
-        )
+        # Report progress to parent context with error handling
+        try:
+            # Try to call error on parent context
+            if hasattr(self.parent_ctx, "error") and callable(self.parent_ctx.error):
+                await self.parent_ctx.error(message)
+            else:
+                # Fallback to report_progress if error method doesn't exist
+                await self.parent_ctx.report_progress(
+                    self.pipeline_state.progress
+                )
+        except Exception as e:
+            logger.warning(f"Error in NodeExecutionContext.error when calling parent context methods: {str(e)}")
+            # No further fallback needed
 
 
 class PipelineExecutionEngine:
@@ -743,10 +762,11 @@ class PipelineExecutionEngine:
 
 
         if pipeline_state.status == PipelineStatus.COMPLETED:
-            await ctx.complete(
+            await safe_context_call(ctx, "complete", 
                 f"Pipeline {pipeline_id} completed successfully. Final artifacts: {json.dumps(final_output_artifacts)}"
             )
         elif pipeline_state.status == PipelineStatus.FAILED:
+            # Still use error directly as it has its own error handling in general
             await ctx.error(
                 f"Pipeline {pipeline_id} failed. Last message: {pipeline_state.message}"
             )
@@ -869,6 +889,7 @@ class PipelineExecutionEngine:
                 task_id=a2a_task_id,
                 session_id=a2a_session_id,
                 ctx=node_ctx,  # Pass the NodeExecutionContext
+                force_non_streaming=True,  # Force non-streaming mode to avoid async generator issues
             )
 
             # Wrap it with a timeout if needed
@@ -1131,7 +1152,14 @@ class PipelineExecutionEngine:
             f"node_status={current_node_status}, message='{pipeline_state.message}'"
         )
 
-        # Report to the FastMCP context
-        await ctx.report_progress(
-            current=pipeline_state.progress, total=1.0, message=pipeline_state.message
-        )
+        # Report to the FastMCP context with defensive programming
+        try:
+            if hasattr(ctx, "report_progress") and callable(ctx.report_progress):
+                await ctx.report_progress(
+                    pipeline_state.progress
+                )
+            else:
+                logger.warning(f"Context has no report_progress method in _report_pipeline_progress for pipeline {pipeline_id}")
+        except Exception as e:
+            logger.warning(f"Error reporting pipeline progress: {str(e)}")
+            # No need for fallback as this is progress reporting

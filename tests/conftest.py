@@ -235,11 +235,10 @@ class MockStreamResponse:
             
         self.delay_between_updates = delay_between_updates
 
-    async def stream_updates(self):
+    def stream_updates(self):
         """Return an async iterator of updates.
 
-        This method is awaitable and returns an async iterator,
-        matching the pattern used in the server code.
+        This method now directly returns an async iterator.
         """
         return StreamUpdateAsyncIterator(self.updates, self.delay_between_updates)
 

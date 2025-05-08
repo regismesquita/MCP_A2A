@@ -23,10 +23,10 @@ class MockContext(AsyncMock):
         self.complete.side_effect = self._track_completion
         self.error.side_effect = self._track_error
 
-    async def _track_progress(self, current: float, total: float, message: str) -> None:
+    async def _track_progress(self, progress: float, total: float = None) -> None:
         """Track a progress report."""
         self.progress_reports.append(
-            {"current": current, "total": total, "message": message}
+            {"current": progress, "total": total or 1.0, "message": ""}
         )
 
     async def _track_completion(self, message: str) -> None:
